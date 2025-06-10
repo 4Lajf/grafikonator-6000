@@ -1,6 +1,14 @@
 -- Scheduling App Database Schema
 -- Run this in your Supabase SQL editor
 
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Migration: Drop old availability tables if they exist
+-- This handles the migration from weekly patterns to date-specific availability
+DROP TABLE IF EXISTS availability_overrides CASCADE;
+DROP TABLE IF EXISTS availability_patterns CASCADE;
+
 -- Create departments table
 CREATE TABLE departments (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -33,7 +41,7 @@ CREATE TABLE time_slots (
 );
 
 -- Create availability table (defines individual availability for specific dates and times)
-CREATE TABLE availability (
+CREATE TABLE IF NOT EXISTS availability (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     individual_id UUID REFERENCES individuals(id) ON DELETE CASCADE,
     date DATE NOT NULL,
