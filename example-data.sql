@@ -105,10 +105,12 @@ BEGIN
 
         IF day_of_week BETWEEN 1 AND 5 THEN -- Monday to Friday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (alice_id, current_date_var, '08:00:00', '17:00:00', 1);
+            VALUES (alice_id, current_date_var, '08:00:00', '17:00:00', 1)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         ELSIF day_of_week IN (0, 6) THEN -- Saturday and Sunday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (alice_id, current_date_var, '10:00:00', '15:00:00', 2);
+            VALUES (alice_id, current_date_var, '10:00:00', '15:00:00', 2)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         END IF;
 
         current_date_var := current_date_var + INTERVAL '1 day';
@@ -130,10 +132,12 @@ BEGIN
 
         IF day_of_week BETWEEN 1 AND 3 THEN -- Monday to Wednesday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (bob_id, current_date_var, '08:00:00', '13:00:00', 1);
+            VALUES (bob_id, current_date_var, '08:00:00', '13:00:00', 1)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         ELSIF day_of_week BETWEEN 4 AND 5 THEN -- Thursday to Friday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (bob_id, current_date_var, '08:00:00', '13:00:00', 2);
+            VALUES (bob_id, current_date_var, '08:00:00', '13:00:00', 2)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         END IF;
 
         current_date_var := current_date_var + INTERVAL '1 day';
@@ -155,13 +159,16 @@ BEGIN
 
         IF day_of_week BETWEEN 1 AND 5 THEN -- Monday to Friday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (carol_id, current_date_var, '14:00:00', '20:00:00', 1);
+            VALUES (carol_id, current_date_var, '14:00:00', '20:00:00', 1)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         ELSIF day_of_week = 6 THEN -- Saturday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (carol_id, current_date_var, '12:00:00', '18:00:00', 2);
+            VALUES (carol_id, current_date_var, '12:00:00', '18:00:00', 2)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         ELSIF day_of_week = 0 THEN -- Sunday
             INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-            VALUES (carol_id, current_date_var, '12:00:00', '18:00:00', 3);
+            VALUES (carol_id, current_date_var, '12:00:00', '18:00:00', 3)
+            ON CONFLICT (individual_id, date, start_time) DO NOTHING;
         END IF;
 
         current_date_var := current_date_var + INTERVAL '1 day';
@@ -193,81 +200,111 @@ BEGIN
                 WHEN 1 THEN -- Full-time flexible (like Maya Patel, Sam Williams)
                     IF day_of_week BETWEEN 1 AND 5 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '20:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '20:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (0, 6) THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '10:00:00', '18:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '18:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 2 THEN -- Morning specialist (like Grace Lee, Rachel Green)
                     IF day_of_week BETWEEN 1 AND 5 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '14:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '14:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week = 6 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '12:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '12:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 3 THEN -- Evening specialist (like Frank Miller)
                     IF day_of_week BETWEEN 1 AND 5 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '12:00:00', '20:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '12:00:00', '20:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week = 6 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '14:00:00', '20:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '14:00:00', '20:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 4 THEN -- Weekend warrior (like David Wilson, Paul Martinez, Victor Lopez)
                     IF day_of_week BETWEEN 1 AND 5 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '17:00:00', '20:00:00', 3);
+                        VALUES (individual_record.id, current_date_var, '17:00:00', '20:00:00', 3)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (0, 6) THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '20:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '20:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 5 THEN -- Student schedule (like Emma Brown, Noah Kim)
                     IF day_of_week IN (1, 3, 5) THEN -- Mon, Wed, Fri
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '09:00:00', '12:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '09:00:00', '12:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '15:00:00', '18:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '15:00:00', '18:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (0, 6) THEN -- Weekends
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '10:00:00', '16:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '16:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 6 THEN -- Part-time mid-day (like Olivia Thompson, Wendy Clark)
                     IF day_of_week BETWEEN 1 AND 5 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '10:00:00', '15:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '15:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week = 6 THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '09:00:00', '13:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '09:00:00', '13:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 7 THEN -- Shift worker (like Jack Anderson, Xavier Scott)
                     IF day_of_week IN (1, 3, 5) THEN -- Alternating shifts
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '16:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '16:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (2, 4) THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '12:00:00', '20:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '12:00:00', '20:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (0, 6) THEN
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '10:00:00', '18:00:00', 2);
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '18:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
 
                 WHEN 8 THEN -- Limited availability (like Liam O'Connor, Yuki Tanaka)
                     IF day_of_week IN (2, 4) THEN -- Tuesday, Thursday only
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '10:00:00', '14:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '14:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (0, 6) THEN -- Weekends
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '08:00:00', '16:00:00', 1);
+                        VALUES (individual_record.id, current_date_var, '08:00:00', '16:00:00', 1)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     ELSIF day_of_week IN (1, 3, 5) THEN -- Other weekdays - emergency only
                         INSERT INTO availability (individual_id, date, start_time, end_time, tier)
-                        VALUES (individual_record.id, current_date_var, '15:00:00', '19:00:00', 3);
+                        VALUES (individual_record.id, current_date_var, '15:00:00', '19:00:00', 3)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
+                    END IF;
+
+                ELSE -- Default pattern for any unexpected pattern_type values
+                    IF day_of_week BETWEEN 1 AND 5 THEN -- Monday to Friday
+                        INSERT INTO availability (individual_id, date, start_time, end_time, tier)
+                        VALUES (individual_record.id, current_date_var, '09:00:00', '17:00:00', 2)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
+                    ELSIF day_of_week IN (0, 6) THEN -- Weekends
+                        INSERT INTO availability (individual_id, date, start_time, end_time, tier)
+                        VALUES (individual_record.id, current_date_var, '10:00:00', '16:00:00', 3)
+                        ON CONFLICT (individual_id, date, start_time) DO NOTHING;
                     END IF;
             END CASE;
 
@@ -282,33 +319,63 @@ END $$;
 -- Alice Johnson has a doctor's appointment next Tuesday (override normal availability)
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '2 days', '09:00:00', '11:00:00', 4
-FROM individuals WHERE name = 'Alice Johnson';
+FROM individuals WHERE name = 'Alice Johnson'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
 
 -- Bob Smith is on vacation for 3 days (not available)
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '5 days', '08:00:00', '20:00:00', 4
-FROM individuals WHERE name = 'Bob Smith';
+FROM individuals WHERE name = 'Bob Smith'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
+
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '6 days', '08:00:00', '20:00:00', 4
-FROM individuals WHERE name = 'Bob Smith';
+FROM individuals WHERE name = 'Bob Smith'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
+
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '7 days', '08:00:00', '20:00:00', 4
-FROM individuals WHERE name = 'Bob Smith';
+FROM individuals WHERE name = 'Bob Smith'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
 
 -- Carol Davis has extended availability for a special event
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '3 days', '08:00:00', '20:00:00', 1
-FROM individuals WHERE name = 'Carol Davis';
+FROM individuals WHERE name = 'Carol Davis'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
 
 -- Emma Brown has a class conflict (not available during normal hours)
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '1 day', '14:00:00', '17:00:00', 4
-FROM individuals WHERE name = 'Emma Brown';
+FROM individuals WHERE name = 'Emma Brown'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
 
 -- Maya Patel is not available for a family event
 INSERT INTO availability (individual_id, date, start_time, end_time, tier)
 SELECT id, CURRENT_DATE + INTERVAL '8 days', '12:00:00', '20:00:00', 4
-FROM individuals WHERE name = 'Maya Patel';
+FROM individuals WHERE name = 'Maya Patel'
+ON CONFLICT (individual_id, date, start_time) DO UPDATE SET
+    end_time = EXCLUDED.end_time,
+    tier = EXCLUDED.tier,
+    updated_at = NOW();
 
 -- Comments for usage
 -- This data provides:
