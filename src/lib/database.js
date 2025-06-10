@@ -390,119 +390,305 @@ export async function getEffectiveAvailability(individualId, timeSlot) {
 
 // Schedules
 export async function getSchedules(date = null) {
-    let query = supabase
-        .from('schedules')
-        .select(`
-            *,
-            individuals(name, email),
-            departments(name),
-            time_slots(date, start_time, end_time)
-        `)
+    return await loggedOperation('getSchedules', async () => {
+        return await withRetry(async () => {
+            let query = supabase
+                .from('schedules')
+                .select(`
+                    *,
+                    individuals(name, email),
+                    departments(name),
+                    time_slots(date, start_time, end_time)
+                `)
 
-    if (date) {
-        query = query.eq('time_slots.date', date)
-    }
+            if (date) {
+                query = query.eq('time_slots.date', date)
+            }
 
-    const { data, error } = await query
-        .order('time_slots.date', { ascending: true })
-        .order('time_slots.start_time', { ascending: true })
+            const { data, error } = await query
 
-    if (error) throw error
-    return data
+            if (error) throw handleDatabaseError(error)
+
+            // Sort the data manually since we can't order by joined table fields directly
+            if (data) {
+                data.sort((a, b) => {
+                    // First sort by date
+                    const dateA = a.time_slots?.date || ''
+                    const dateB = b.time_slots?.date || ''
+                    if (dateA !== dateB) {
+                        return dateA.localeCompare(dateB)
+                    }
+
+                    // Then sort by start time
+                    const timeA = a.time_slots?.start_time || ''
+                    const timeB = b.time_slots?.start_time || ''
+                    return timeA.localeCompare(timeB)
+                })
+            }
+
+            logger.database('SELECT', 'schedules', {
+                count: data?.length,
+                date
+            })
+            return data
+        })
+    })
 }
 
 export async function createSchedule(schedule) {
-    const { data, error } = await supabase
-        .from('schedules')
-        .insert([schedule])
-        .select(`
-            *,
-            individuals(name, email),
-            departments(name),
-            time_slots(date, start_time, end_time)
-        `)
-        .single()
+    return await loggedOperation('createSchedule', async () => {
+        return await withRetry(async () => {
+            const { data, error } = await supabase
+                .from('schedules')
+                .insert([schedule])
+                .select(`
+                    *,
+                    individuals(name, email),
+                    departments(name),
+                    time_slots(date, start_time, end_time)
+                `)
+                .single()
 
-    if (error) throw error
-    return data
+            if (error) throw handleDatabaseError(error)
+
+            logger.database('INSERT', 'schedules', {
+                individual_id: schedule.individual_id,
+                department_id: schedule.department_id,
+                time_slot_id: schedule.time_slot_id
+            })
+            return data
+        })
+    })
+}
+
+// Batch create multiple schedules for optimal performance
+export async function batchCreateSchedules(schedules) {
+    return await loggedOperation('batchCreateSchedules', async () => {
+        return await withRetry(async () => {
+            if (!schedules || schedules.length === 0) {
+                return []
+            }
+
+            const { data, error } = await supabase
+                .from('schedules')
+                .insert(schedules)
+                .select(`
+                    *,
+                    individuals(name, email),
+                    departments(name),
+                    time_slots(date, start_time, end_time)
+                `)
+
+            if (error) throw handleDatabaseError(error)
+
+            logger.database('BATCH_INSERT', 'schedules', {
+                count: schedules.length,
+                schedules: schedules.map(s => ({
+                    individual_id: s.individual_id,
+                    department_id: s.department_id,
+                    time_slot_id: s.time_slot_id
+                }))
+            })
+            return data
+        })
+    })
 }
 
 export async function updateSchedule(id, updates) {
-    const { data, error } = await supabase
-        .from('schedules')
-        .update({ ...updates, updated_at: new Date().toISOString() })
-        .eq('id', id)
-        .select(`
-            *,
-            individuals(name, email),
-            departments(name),
-            time_slots(date, start_time, end_time)
-        `)
-        .single()
+    return await loggedOperation('updateSchedule', async () => {
+        return await withRetry(async () => {
+            const { data, error } = await supabase
+                .from('schedules')
+                .update({ ...updates, updated_at: new Date().toISOString() })
+                .eq('id', id)
+                .select(`
+                    *,
+                    individuals(name, email),
+                    departments(name),
+                    time_slots(date, start_time, end_time)
+                `)
+                .single()
 
-    if (error) throw error
-    return data
+            if (error) throw handleDatabaseError(error)
+
+            logger.database('UPDATE', 'schedules', {
+                id,
+                updates: Object.keys(updates)
+            })
+            return data
+        })
+    })
 }
 
 export async function deleteSchedule(id) {
-    const { error } = await supabase
-        .from('schedules')
-        .delete()
-        .eq('id', id)
-    
-    if (error) throw error
+    return await loggedOperation('deleteSchedule', async () => {
+        return await withRetry(async () => {
+            const { error } = await supabase
+                .from('schedules')
+                .delete()
+                .eq('id', id)
+
+            if (error) throw handleDatabaseError(error)
+
+            logger.database('DELETE', 'schedules', { id })
+            return true
+        })
+    })
+}
+
+// Batch delete multiple schedules for optimal performance
+export async function batchDeleteSchedules(scheduleIds) {
+    return await loggedOperation('batchDeleteSchedules', async () => {
+        return await withRetry(async () => {
+            if (!scheduleIds || scheduleIds.length === 0) {
+                return { count: 0 }
+            }
+
+            const { data, error } = await supabase
+                .from('schedules')
+                .delete()
+                .in('id', scheduleIds)
+                .select('id')
+
+            if (error) throw handleDatabaseError(error)
+
+            logger.database('BATCH_DELETE', 'schedules', {
+                count: scheduleIds.length,
+                deletedIds: data?.map(d => d.id) || []
+            })
+
+            return {
+                count: data?.length || 0,
+                deletedIds: data?.map(d => d.id) || []
+            }
+        })
+    })
 }
 
 // Auto-scheduling logic
 export async function autoSchedule(departmentId, timeSlotId) {
-    // Get the time slot details
-    const { data: timeSlot, error: timeSlotError } = await supabase
-        .from('time_slots')
-        .select('*')
-        .eq('id', timeSlotId)
-        .single()
+    return await loggedOperation('autoSchedule', async () => {
+        return await withRetry(async () => {
+            // Get the time slot details
+            const { data: timeSlot, error: timeSlotError } = await supabase
+                .from('time_slots')
+                .select('*')
+                .eq('id', timeSlotId)
+                .single()
 
-    if (timeSlotError) throw timeSlotError
+            if (timeSlotError) throw handleDatabaseError(timeSlotError)
 
-    // Get all individuals
-    const { data: individuals, error: individualsError } = await supabase
-        .from('individuals')
-        .select('*')
+            // Get all individuals
+            const { data: individuals, error: individualsError } = await supabase
+                .from('individuals')
+                .select('*')
 
-    if (individualsError) throw individualsError
+            if (individualsError) throw handleDatabaseError(individualsError)
 
-    // Get existing schedules for this time slot
-    const { data: existingSchedules } = await supabase
-        .from('schedules')
-        .select('individual_id')
-        .eq('time_slot_id', timeSlotId)
+            // Get existing schedules for this time slot
+            const { data: existingSchedules, error: schedulesError } = await supabase
+                .from('schedules')
+                .select('individual_id')
+                .eq('time_slot_id', timeSlotId)
 
-    const scheduledIndividualIds = new Set(existingSchedules?.map(s => s.individual_id) || [])
+            if (schedulesError) throw handleDatabaseError(schedulesError)
 
-    // Find the best available person
-    let bestPerson = null
-    let bestTier = 5 // Start with worse than tier 4
+            const scheduledIndividualIds = new Set(existingSchedules?.map(s => s.individual_id) || [])
 
-    for (const individual of individuals) {
-        if (scheduledIndividualIds.has(individual.id)) continue
+            // Find the best available person
+            let bestPerson = null
+            let bestTier = 5 // Start with worse than tier 4
 
-        const tier = await getEffectiveAvailability(individual.id, timeSlot)
+            for (const individual of individuals) {
+                if (scheduledIndividualIds.has(individual.id)) continue
 
-        if (tier < 4 && tier < bestTier) {
-            bestPerson = individual
-            bestTier = tier
-        }
-    }
+                const tier = await getEffectiveAvailability(individual.id, timeSlot)
 
-    if (!bestPerson) {
-        throw new Error('No available person found for this time slot')
-    }
+                if (tier < 4 && tier < bestTier) {
+                    bestPerson = individual
+                    bestTier = tier
+                }
+            }
 
-    // Create the schedule
-    return await createSchedule({
-        individual_id: bestPerson.id,
-        department_id: departmentId,
-        time_slot_id: timeSlotId,
-        status: 'scheduled'
+            if (!bestPerson) {
+                throw new Error('No available person found for this time slot')
+            }
+
+            logger.database('AUTO_SCHEDULE', 'schedules', {
+                departmentId,
+                timeSlotId,
+                selectedPerson: bestPerson.name,
+                availabilityTier: bestTier
+            })
+
+            // Create the schedule
+            return await createSchedule({
+                individual_id: bestPerson.id,
+                department_id: departmentId,
+                time_slot_id: timeSlotId,
+                status: 'scheduled'
+            })
+        })
+    })
+}
+
+// Auto-schedule all empty slots for a specific date
+export async function autoScheduleAll(date) {
+    return await loggedOperation('autoScheduleAll', async () => {
+        return await withRetry(async () => {
+            // Get all time slots for the date
+            const timeSlots = await getTimeSlots(date)
+
+            // Get all departments
+            const departments = await getDepartments()
+
+            // Get existing schedules for the date
+            const existingSchedules = await getSchedules(date)
+
+            const results = []
+            const errors = []
+
+            // For each time slot and department combination
+            for (const timeSlot of timeSlots) {
+                for (const department of departments) {
+                    // Check if this slot is already filled
+                    const existingSchedule = existingSchedules.find(s =>
+                        s.time_slot_id === timeSlot.id &&
+                        s.department_id === department.id
+                    )
+
+                    if (!existingSchedule) {
+                        try {
+                            const schedule = await autoSchedule(department.id, timeSlot.id)
+                            results.push({
+                                success: true,
+                                schedule,
+                                timeSlot,
+                                department
+                            })
+                        } catch (error) {
+                            errors.push({
+                                success: false,
+                                error: error.message,
+                                timeSlot,
+                                department
+                            })
+                        }
+                    }
+                }
+            }
+
+            logger.database('AUTO_SCHEDULE_ALL', 'schedules', {
+                date,
+                successCount: results.length,
+                errorCount: errors.length
+            })
+
+            return {
+                successes: results,
+                errors,
+                totalProcessed: results.length + errors.length
+            }
+        })
     })
 }

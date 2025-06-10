@@ -62,7 +62,7 @@
 
 <Toaster
 	richColors
-	position="top-right"
+	position="bottom-right"
 	expand={true}
 	duration={4000}
 	closeButton={true}
