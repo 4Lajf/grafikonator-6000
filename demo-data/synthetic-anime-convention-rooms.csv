@@ -1,0 +1,11 @@
+Sala,Pojemność,Tagi,Polityka hałasu,Uwagi
+Main Stage,200,main_stage,loud_ok,"Best for opening, cosplay, concerts, dance shows and other headline events."
+Auditorium,200,,normal,Large seated room for high-interest talks and guest panels.
+Contest Room,200,,loud_ok,Quiz and competition room with audio and scoring setup.
+Panel Room A,100,,quiet,Standard lecture room.
+Panel Room B,100,,quiet,Standard lecture room.
+Panel Room C,100,,quiet,Standard lecture room.
+Workshop Room,100,,normal,Tables and material handling for craft sessions.
+Small Club Room,20,,quiet,Small discussion room for niche sessions.
+Open Corridor Zone,100,,normal,Drop-in hallway activities and short social events.
+Rhythm Games Zone,100,,loud_ok,Dedicated rhythm game corner.

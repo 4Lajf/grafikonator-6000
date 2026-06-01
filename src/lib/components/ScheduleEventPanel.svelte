@@ -7,10 +7,12 @@
 		validateScheduleMove,
 		validateEventPlacement,
 		deleteSchedule,
-		TIER_OPTIONS
+		updateEvent,
+		TIER_OPTIONS,
+		EVENT_TIER_OPTIONS
 	} from '$lib/database.js';
 	import { toast } from 'svelte-sonner';
-	import { CircleAlert, TriangleAlert, X, Pencil, Trash2 } from 'lucide-svelte';
+	import { CircleAlert, TriangleAlert, X, Pencil, Trash2, Lock, Unlock } from 'lucide-svelte';
 
 	let {
 		schedule = null,
@@ -21,7 +23,8 @@
 		timeSlots = [],
 		issues = [],
 		onclose = () => {},
-		onsaved = () => {}
+		onsaved = () => {},
+		onstartswap = () => {}
 	} = $props();
 
 	let loading = $state(true);
@@ -29,8 +32,14 @@
 	let editingSchedule = $state(false);
 	let availabilityGrid = $state([]);
 	let slotTiers = $state({});
+	let eventTier = $state(2);
+	let autoSchedule = $state(true);
+	let estimatedAttendance = $state('');
+	let requiredRoomTags = $state('');
+	let eventKind = $state('');
 	let scheduleForm = $state(null);
 	let validationMessage = $state('');
+	let validationSeverity = $state('');
 
 	const panelWidth = 360;
 	const panelMaxHeight = 520;
@@ -66,6 +75,26 @@
 	const panelOrganizerNotes = $derived(
 		schedule?.event?.organizer_notes ?? unscheduledEvent?.organizer_notes ?? ''
 	);
+	const panelEventTier = $derived(schedule?.event?.tier ?? unscheduledEvent?.tier ?? 2);
+	const panelAutoSchedule = $derived(
+		(schedule?.event?.auto_schedule ?? unscheduledEvent?.auto_schedule ?? 1) !== 0
+	);
+	const panelEstimatedAttendance = $derived(
+		schedule?.event?.estimated_attendance ?? unscheduledEvent?.estimated_attendance ?? ''
+	);
+	const panelRequiredRoomTags = $derived(
+		(schedule?.event?.required_room_tags ?? unscheduledEvent?.required_room_tags ?? []).join(', ')
+	);
+	const panelEventKind = $derived(schedule?.event?.kind ?? unscheduledEvent?.kind ?? '');
+	const scheduleLocked = $derived(schedule?.locked === true);
+	const eventId = $derived(schedule?.event?.id ?? unscheduledEvent?.id ?? null);
+	const hostLabel = $derived(
+		schedule?.host_name ||
+			unscheduledEvent?.host_name ||
+			schedule?.hosts?.[0]?.display_name ||
+			unscheduledEvent?.hosts?.[0]?.display_name ||
+			'—'
+	);
 	const slotCount = $derived(
 		convention?.slot_minutes
 			? Math.ceil(panelDuration / convention.slot_minutes)
@@ -96,7 +125,16 @@
 			scheduleForm.start_time_slot_id !== schedule.start_time_slot_id
 		);
 	});
-	const isDirty = $derived(tiersDirty || scheduleDirty);
+	const eventTierDirty = $derived(eventId != null && Number(eventTier) !== Number(panelEventTier));
+	const autoScheduleDirty = $derived(eventId != null && Boolean(autoSchedule) !== panelAutoSchedule);
+	const eventMetadataDirty = $derived(
+		eventId != null &&
+			(String(estimatedAttendance) !== String(panelEstimatedAttendance ?? '') ||
+				requiredRoomTags !== panelRequiredRoomTags ||
+				eventKind !== panelEventKind)
+	);
+	const eventSettingsDirty = $derived(eventTierDirty || autoScheduleDirty || eventMetadataDirty);
+	const isDirty = $derived(tiersDirty || scheduleDirty || eventSettingsDirty);
 
 	function formatTime(timeStr) {
 		return String(timeStr || '').slice(0, 5);
@@ -119,9 +157,25 @@
 		});
 	}
 
+	function tierBtnColor(tier) {
+		if (tier === 1) return '#34a853';
+		if (tier === 3) return '#ea4335';
+		return '#fbbc04';
+	}
+
+	function cycleSlotTier(slotId) {
+		const current = Number(slotTiers[slotId] ?? 2);
+		setSlotTier(slotId, current === 3 ? 1 : current + 1);
+	}
+
 	function initForms(grid = availabilityGrid) {
 		const allSlots = grid.flatMap((day) => day.slots);
 		slotTiers = Object.fromEntries(allSlots.map((slot) => [slot.id, slot.tier]));
+		eventTier = Number(schedule?.event?.tier ?? unscheduledEvent?.tier ?? 2);
+		autoSchedule = (schedule?.event?.auto_schedule ?? unscheduledEvent?.auto_schedule ?? 1) !== 0;
+		estimatedAttendance = String(panelEstimatedAttendance ?? '');
+		requiredRoomTags = panelRequiredRoomTags;
+		eventKind = panelEventKind;
 		if (schedule) {
 			scheduleForm = {
 				room_id: schedule.room_id,
@@ -136,6 +190,7 @@
 			scheduleForm = null;
 		}
 		validationMessage = '';
+		validationSeverity = '';
 	}
 
 	async function loadDetails() {
@@ -177,9 +232,23 @@
 					scheduleForm.room_id,
 					scheduleForm.start_time_slot_id
 				);
-		validationMessage = validation.valid
-			? validation.warning || ''
-			: validation.reason || 'Konflikt w grafiku';
+		if (!validation.valid) {
+			validationSeverity = 'error';
+			validationMessage = validation.reason || 'Konflikt w grafiku';
+			return;
+		}
+		if (validation.warning) {
+			validationSeverity = 'warning';
+			validationMessage = validation.warning;
+			return;
+		}
+		if (validation.info) {
+			validationSeverity = 'info';
+			validationMessage = validation.info;
+			return;
+		}
+		validationSeverity = '';
+		validationMessage = '';
 	}
 
 	async function handleSave() {
@@ -195,6 +264,10 @@
 						slot_count: slotCount
 					});
 				} else {
+					if (scheduleLocked) {
+						toast.error('Pozycja zablokowana — odblokuj ją przed zmianą grafiku');
+						return;
+					}
 					await updateSchedule(schedule.id, {
 						room_id: scheduleForm.room_id,
 						start_time_slot_id: scheduleForm.start_time_slot_id,
@@ -218,10 +291,20 @@
 				}
 			}
 
+			if (eventSettingsDirty && eventId) {
+				await updateEvent(eventId, {
+					tier: Number(eventTier),
+					auto_schedule: Boolean(autoSchedule),
+					estimated_attendance: estimatedAttendance,
+					required_room_tags: requiredRoomTags,
+					kind: eventKind.trim() || null
+				});
+			}
+
 			toast.success(unscheduledEvent && scheduleDirty ? 'Zaplanowano atrakcję' : 'Zapisano zmiany');
 			editingSchedule = false;
 			onsaved({
-				scheduleChanged: scheduleDirty,
+				scheduleChanged: scheduleDirty || eventSettingsDirty,
 				availabilityHostIds: tiersDirty && hostId ? [hostId] : []
 			});
 			if (unscheduledEvent && scheduleDirty) {
@@ -245,6 +328,22 @@
 			onclose();
 		} catch (error) {
 			toast.error('Błąd usuwania', { description: error.message });
+		}
+	}
+
+	async function handleToggleLock() {
+		if (!schedule) return;
+		saving = true;
+		try {
+			await updateSchedule(schedule.id, { locked: !scheduleLocked });
+			toast.success(scheduleLocked ? 'Odblokowano pozycję' : 'Zablokowano pozycję');
+			editingSchedule = false;
+			onsaved({ scheduleChanged: true });
+			await loadDetails();
+		} catch (error) {
+			toast.error('Błąd blokady', { description: error.message });
+		} finally {
+			saving = false;
 		}
 	}
 
@@ -297,8 +396,10 @@
 								<div class="panel-issue panel-issue--{issue.severity}">
 									{#if issue.severity === 'error'}
 										<CircleAlert size={14} />
-									{:else}
+									{:else if issue.severity === 'warning'}
 										<TriangleAlert size={14} />
+									{:else}
+										<span aria-hidden="true">ℹ</span>
 									{/if}
 									<span>{issue.message}</span>
 								</div>
@@ -307,51 +408,104 @@
 					</section>
 				{/if}
 
+				<section class="panel-hype">
+					<div class="panel-hype-grid">
+						<div class="panel-hype-cell">
+							<span class="panel-hype-label">Pseudonim</span>
+							<span class="panel-hype-value">{hostLabel}</span>
+						</div>
+						<div class="panel-hype-cell">
+							<span class="panel-hype-label">Tytuł</span>
+							<span class="panel-hype-value">{panelTitle}</span>
+						</div>
+						<div class="panel-hype-cell panel-hype-cell--narrow">
+							<span class="panel-hype-label">Czas</span>
+							<span class="panel-hype-value">{panelDuration} min</span>
+						</div>
+						<div class="panel-hype-cell panel-hype-cell--tier">
+							<span class="panel-hype-label">Tier atrakcji</span>
+							<div class="tier-buttons tier-buttons--compact">
+								{#each EVENT_TIER_OPTIONS as tier}
+									<button
+										type="button"
+										class="tier-btn"
+										class:tier-btn--active={Number(eventTier) === tier.value}
+										style="--tier-color:{tierBtnColor(tier.value)}"
+										title={tier.label}
+										onclick={() => (eventTier = tier.value)}
+									>
+										T{tier.value}
+									</button>
+								{/each}
+							</div>
+						</div>
+						<label class="panel-auto-plan">
+							<input type="checkbox" bind:checked={autoSchedule} />
+							<span>
+								<span class="panel-hype-label">Auto-plan</span>
+								<span class="panel-hype-value">Planuj automatycznie</span>
+							</span>
+						</label>
+					</div>
+					{#if panelOrganizerNotes?.trim()}
+						<p class="panel-hype-notes">
+							<span class="panel-hype-label">Notatki</span>
+							{panelOrganizerNotes}
+						</p>
+					{/if}
+				</section>
+
 				<section class="panel-section">
-					<h3>Atrakcja</h3>
-					<dl class="panel-dl">
-						<div><dt>Pseudonim</dt><dd>{schedule?.host_name || unscheduledEvent?.host_name || schedule?.hosts?.[0]?.display_name || unscheduledEvent?.hosts?.[0]?.display_name || '—'}</dd></div>
-						<div><dt>Tytuł</dt><dd>{panelTitle}</dd></div>
-						<div><dt>Czas trwania</dt><dd>{panelDuration} min</dd></div>
-						{#if panelOrganizerNotes?.trim()}
-							<div><dt>Notatki organizatora</dt><dd>{panelOrganizerNotes}</dd></div>
-						{/if}
-					</dl>
+					<h3>Wymagania sali</h3>
+					<div class="panel-form-grid">
+						<label class="panel-field">
+							<span>Szacowana frekwencja</span>
+							<input type="number" min="0" bind:value={estimatedAttendance} placeholder="np. 50" />
+						</label>
+						<label class="panel-field">
+							<span>Typ atrakcji</span>
+							<input bind:value={eventKind} placeholder="np. Prelekcja, Konkurs, Warsztaty" />
+						</label>
+						<label class="panel-field panel-field--full">
+							<span>Wymagane tagi sali</span>
+							<input bind:value={requiredRoomTags} placeholder="projector, quiet_room" />
+						</label>
+					</div>
 				</section>
 
 				{#if hostId && availabilityGrid.length > 0}
-					<section class="panel-section">
+					<section class="panel-section panel-section--availability">
 						<h3>Dyspozycyjność</h3>
-						<div class="tier-days">
+						<div class="avail-legend">
+							{#each TIER_OPTIONS as tier}
+								<span class="avail-legend-item">
+									<span
+										class="avail-legend-dot"
+										style="background:{tierBtnColor(tier.value)}"
+									></span>
+									{tier.value}
+								</span>
+							{/each}
+							<span class="avail-legend-hint">Kliknij slot</span>
+						</div>
+						<div class="avail-days">
 							{#each availabilityGrid as day}
-								<div class="tier-day">
-									<div class="tier-day-header">{formatDate(day.date)}</div>
-									<div class="tier-grid">
+								<div class="avail-day">
+									<div class="avail-day-header">{formatDate(day.date)}</div>
+									<div class="avail-slots">
 										{#each day.slots as slot}
-											<div class="tier-entry" class:tier-entry--event={eventSlotIds.has(slot.id)}>
-												<div class="tier-row">
-													<span class="tier-row-time">
-														{formatTime(slot.start_time)}–{formatTime(slot.end_time)}
-													</span>
-													<div class="tier-buttons">
-														{#each TIER_OPTIONS as tier}
-															<button
-																type="button"
-																class="tier-btn"
-																class:tier-btn--active={Number(slotTiers[slot.id]) === tier.value}
-																style="--tier-color:{tier.value === 1 ? '#34a853' : tier.value === 2 ? '#fbbc04' : '#ea4335'}"
-																title={tier.label}
-																onclick={() => setSlotTier(slot.id, tier.value)}
-															>
-																{tier.value}
-															</button>
-														{/each}
-													</div>
-												</div>
-												<div class="tier-label">
-													{TIER_OPTIONS.find((t) => t.value === Number(slotTiers[slot.id]))?.label || '—'}
-												</div>
-											</div>
+											<button
+												type="button"
+												class="avail-chip"
+												class:avail-chip--event={eventSlotIds.has(slot.id)}
+												class:avail-chip--t1={Number(slotTiers[slot.id]) === 1}
+												class:avail-chip--t2={Number(slotTiers[slot.id]) === 2}
+												class:avail-chip--t3={Number(slotTiers[slot.id]) === 3}
+												title="{formatTime(slot.start_time)}–{formatTime(slot.end_time)}: {TIER_OPTIONS.find((t) => t.value === Number(slotTiers[slot.id]))?.label}"
+												onclick={() => cycleSlotTier(slot.id)}
+											>
+												{formatTime(slot.start_time)}
+											</button>
 										{/each}
 									</div>
 								</div>
@@ -382,24 +536,46 @@
 							</select>
 						</label>
 						{#if validationMessage}
-							<div class="panel-validation">{validationMessage}</div>
+							<div class="panel-validation panel-validation--{validationSeverity}">{validationMessage}</div>
 						{/if}
 					</section>
 				{/if}
 
 				<div class="panel-actions">
 					{#if schedule}
+						<div class="panel-lock-state" class:panel-lock-state--locked={scheduleLocked}>
+							{#if scheduleLocked}
+								<Lock size={14} />
+								<span>Pozycja zablokowana — ta atrakcja nie będzie przenoszona.</span>
+							{:else}
+								<Unlock size={14} />
+								<span>Pozycja odblokowana.</span>
+							{/if}
+						</div>
 						<button class="panel-btn panel-btn--danger" onclick={handleDelete}>
 							<Trash2 size={14} /> Usuń
 						</button>
+						<button class="panel-btn" onclick={handleToggleLock} disabled={saving}>
+							{#if scheduleLocked}
+								<Unlock size={14} /> Odblokuj
+							{:else}
+								<Lock size={14} /> Zablokuj
+							{/if}
+						</button>
 					{/if}
 					{#if !editingSchedule}
+						{#if schedule}
+							<button class="panel-btn" onclick={() => onstartswap(schedule)} disabled={scheduleLocked}>
+								Znajdź zamianę
+							</button>
+						{/if}
 						<button
 							class="panel-btn"
 							onclick={() => {
 								editingSchedule = true;
 								previewScheduleEdit();
 							}}
+							disabled={scheduleLocked && schedule}
 						>
 							<Pencil size={14} /> {unscheduledEvent ? 'Zaplanuj' : 'Grafik'}
 						</button>
@@ -420,6 +596,7 @@
 									};
 								}
 								validationMessage = '';
+								validationSeverity = '';
 							}}
 						>
 							Anuluj grafik
@@ -529,29 +706,179 @@
 		color: #5f6368;
 	}
 
-	.panel-dl {
-		display: grid;
-		gap: 0.375rem;
+	.panel-hype {
+		margin-bottom: 0.5rem;
 	}
 
-	.panel-dl div {
-		display: grid;
-		grid-template-columns: 6.5rem 1fr;
+	.panel-hype-grid {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 0.75rem;
+		align-items: flex-end;
+	}
+
+	.panel-hype-cell {
+		display: flex;
+		flex-direction: column;
+		gap: 0.125rem;
+		min-width: 0;
+		flex: 1 1 7rem;
+	}
+
+	.panel-hype-cell--narrow {
+		flex: 0 1 4.5rem;
+	}
+
+	.panel-hype-cell--tier {
+		flex: 1 1 100%;
+	}
+
+	.panel-auto-plan {
+		display: flex;
+		align-items: center;
 		gap: 0.5rem;
-		align-items: start;
+		flex: 1 1 100%;
+		padding: 0.375rem 0.5rem;
+		border: 1px solid #e8eaed;
+		border-radius: 4px;
+		background: #f8f9fa;
+		cursor: pointer;
 	}
 
-	.panel-dl dt {
-		margin: 0;
-		font-size: 11px;
+	.panel-hype-label {
+		font-size: 10px;
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
 		color: #5f6368;
 	}
 
-	.panel-dl dd {
-		margin: 0;
+	.panel-hype-value {
 		font-size: 12px;
-		line-height: 1.35;
+		line-height: 1.3;
+		color: #202124;
 		word-break: break-word;
+	}
+
+	.panel-hype-notes {
+		margin: 0.5rem 0 0;
+		font-size: 11px;
+		line-height: 1.35;
+		color: #3c4043;
+	}
+
+	.panel-hype-notes .panel-hype-label {
+		margin-right: 0.375rem;
+	}
+
+	.panel-form-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.5rem;
+	}
+
+	.panel-field--full {
+		grid-column: 1 / -1;
+	}
+
+	.panel-section--availability {
+		margin-top: 0.625rem;
+		padding-top: 0.625rem;
+		border-top: 1px solid #e8eaed;
+	}
+
+	.panel-section--availability h3 {
+		margin: 0 0 0.375rem;
+		font-size: 11px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: #5f6368;
+	}
+
+	.avail-legend {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 0.75rem;
+		margin-bottom: 0.5rem;
+		font-size: 10px;
+		color: #5f6368;
+	}
+
+	.avail-legend-item {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+	}
+
+	.avail-legend-dot {
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 2px;
+	}
+
+	.avail-legend-hint {
+		color: #80868b;
+	}
+
+	.avail-days {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		max-height: 120px;
+		overflow-y: auto;
+		padding-right: 0.125rem;
+	}
+
+	.avail-day-header {
+		margin-bottom: 0.25rem;
+		font-size: 10px;
+		font-weight: 600;
+		color: #3c4043;
+	}
+
+	.avail-slots {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+
+	.avail-chip {
+		padding: 0.125rem 0.375rem;
+		border: 1px solid #dadce0;
+		border-radius: 3px;
+		background: #fff;
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+		cursor: pointer;
+		line-height: 1.4;
+	}
+
+	.avail-chip--t1 {
+		background: #e6f4ea;
+		border-color: #34a853;
+		color: #137333;
+	}
+
+	.avail-chip--t2 {
+		background: #fef7e0;
+		border-color: #fbbc04;
+		color: #b06000;
+	}
+
+	.avail-chip--t3 {
+		background: #fce8e6;
+		border-color: #ea4335;
+		color: #c5221f;
+	}
+
+	.avail-chip--event {
+		box-shadow: 0 0 0 2px #1a73e8;
+	}
+
+	.avail-chip:hover {
+		filter: brightness(0.97);
 	}
 
 	.panel-issues {
@@ -580,59 +907,17 @@
 		color: #b06000;
 	}
 
-	.tier-days {
-		display: flex;
-		flex-direction: column;
-		gap: 0.75rem;
-		max-height: 240px;
-		overflow-y: auto;
-		padding-right: 0.125rem;
-	}
-
-	.tier-day-header {
-		margin-bottom: 0.375rem;
-		font-size: 11px;
-		font-weight: 600;
-		color: #3c4043;
-	}
-
-	.tier-entry {
-		padding: 0.25rem 0;
-	}
-
-	.tier-entry + .tier-entry {
-		border-top: 1px solid #f1f3f4;
-	}
-
-	.tier-entry--event {
-		margin: 0 -0.375rem;
-		padding: 0.25rem 0.375rem;
-		border-radius: 4px;
+	.panel-issue--info {
 		background: #e8f0fe;
-		border-top: none;
+		color: #1967d2;
 	}
 
-	.tier-entry--event + .tier-entry {
-		border-top: 1px solid #f1f3f4;
-	}
-
-	.tier-grid {
-		display: flex;
-		flex-direction: column;
-		gap: 0.375rem;
-	}
-
-	.tier-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.5rem;
-	}
-
-	.tier-row-time {
-		font-size: 11px;
-		font-variant-numeric: tabular-nums;
-		color: #3c4043;
+	.tier-buttons--compact .tier-btn {
+		width: auto;
+		min-width: 1.75rem;
+		padding: 0 0.375rem;
+		height: 1.5rem;
+		font-size: 10px;
 	}
 
 	.tier-buttons {
@@ -655,12 +940,6 @@
 		border-color: var(--tier-color);
 		color: var(--tier-color);
 		font-weight: 600;
-	}
-
-	.tier-label {
-		margin-top: -0.25rem;
-		font-size: 10px;
-		color: #5f6368;
 	}
 
 	.panel-field {
@@ -694,6 +973,21 @@
 		font-size: 11px;
 	}
 
+	.panel-validation--error {
+		background: #fce8e6;
+		color: #c5221f;
+	}
+
+	.panel-validation--warning {
+		background: #fef7e0;
+		color: #b06000;
+	}
+
+	.panel-validation--info {
+		background: #e8f0fe;
+		color: #1967d2;
+	}
+
 	.panel-actions {
 		display: flex;
 		justify-content: flex-end;
@@ -702,6 +996,25 @@
 		margin-top: 0.875rem;
 		padding-top: 0.875rem;
 		border-top: 1px solid #e8eaed;
+	}
+
+	.panel-lock-state {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		flex: 1 0 100%;
+		padding: 0.5rem 0.625rem;
+		border: 1px solid #dadce0;
+		border-radius: 6px;
+		background: #f8f9fa;
+		color: #5f6368;
+		font-size: 12px;
+	}
+
+	.panel-lock-state--locked {
+		border-color: #f9ab00;
+		background: #fef7e0;
+		color: #b06000;
 	}
 
 	.panel-btn {

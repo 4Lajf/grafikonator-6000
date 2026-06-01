@@ -82,3 +82,30 @@ export function parseYesNo(raw) {
 	const text = String(raw).trim().toLowerCase();
 	return /^(tak|yes|true|1|potrzebuję od was|potrzebuje od was)$/i.test(text) || text.includes('tak');
 }
+
+/**
+ * @param {string} raw
+ * @returns {number}
+ */
+export function parseEventTier(raw) {
+	const text = String(raw || '').trim().toLowerCase();
+	if (!text) return 2;
+	const labeled = text.match(/(?:t(?:ier)?\s*)?([123])/);
+	if (labeled) return Number(labeled[1]);
+	const n = Number(text);
+	if (n === 1 || n === 2 || n === 3) return n;
+	return 2;
+}
+
+/**
+ * @param {string} raw
+ * @returns {boolean}
+ */
+export function parseAutoSchedule(raw) {
+	if (raw === undefined || raw === null || String(raw).trim() === '') return true;
+	const text = String(raw).trim().toLowerCase();
+	if (/^(nie|no|false|0|off|wyłącz|wylacz|ręcznie|recznie|manual|nie planuj)/i.test(text)) {
+		return false;
+	}
+	return true;
+}

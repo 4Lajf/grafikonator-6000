@@ -11,7 +11,8 @@
 		updateEvent,
 		deleteEvent,
 		setAvailability,
-		TIER_OPTIONS
+		TIER_OPTIONS,
+		EVENT_TIER_OPTIONS
 	} from '$lib/database.js';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Card from '$lib/components/ui/card/card.svelte';
@@ -109,7 +110,8 @@
 			id: event.id,
 			title: event.title,
 			duration_minutes: event.duration_minutes,
-			organizer_notes: event.organizer_notes || ''
+			organizer_notes: event.organizer_notes || '',
+			tier: event.tier ?? 2
 		};
 	}
 
@@ -119,7 +121,8 @@
 			await updateEvent(editingEvent.id, {
 				title: editingEvent.title,
 				duration_minutes: editingEvent.duration_minutes,
-				organizer_notes: editingEvent.organizer_notes
+				organizer_notes: editingEvent.organizer_notes,
+				tier: editingEvent.tier
 			});
 			toast.success('Zapisano atrakcję');
 			await selectPerson(selectedPerson);
@@ -148,7 +151,8 @@
 	function startNewEvent() {
 		newEvent = {
 			title: '',
-			duration_minutes: 60
+			duration_minutes: 60,
+			tier: 2
 		};
 	}
 
@@ -256,7 +260,7 @@
 									<Button size="sm" variant="outline" onclick={() => (editingPerson = null)}>Anuluj</Button>
 								{:else}
 									<Button size="sm" variant="outline" onclick={startEditPerson}>Edytuj dane</Button>
-									<Button size="sm" variant="outline" onclick={handleDeletePerson} disabled={saving}>Usuń osobę</Button>
+									<Button size="sm" variant="destructive" onclick={handleDeletePerson} disabled={saving}>Usuń osobę</Button>
 								{/if}
 							</div>
 						</div>
@@ -302,6 +306,14 @@
 										<Label for="new-duration">Czas trwania (min)</Label>
 										<Input id="new-duration" type="number" min="1" bind:value={newEvent.duration_minutes} />
 									</div>
+									<div>
+										<Label for="new-tier">Tier atrakcji</Label>
+										<select id="new-tier" class="g-select" bind:value={newEvent.tier}>
+											{#each EVENT_TIER_OPTIONS as tier}
+												<option value={tier.value}>{tier.label}</option>
+											{/each}
+										</select>
+									</div>
 								</div>
 								<div class="flex gap-2">
 									<Button size="sm" onclick={saveNewEvent} disabled={saving}>Dodaj</Button>
@@ -323,6 +335,14 @@
 												<Label for="edit-duration">Czas trwania (min)</Label>
 												<Input id="edit-duration" type="number" min="1" bind:value={editingEvent.duration_minutes} />
 											</div>
+											<div>
+												<Label for="edit-tier">Tier atrakcji</Label>
+												<select id="edit-tier" class="g-select" bind:value={editingEvent.tier}>
+													{#each EVENT_TIER_OPTIONS as tier}
+														<option value={tier.value}>{tier.label}</option>
+													{/each}
+												</select>
+											</div>
 											<div class="col-span-2">
 												<Label for="edit-org-notes">Notatki organizatora</Label>
 												<textarea id="edit-org-notes" class="g-textarea" rows="2" bind:value={editingEvent.organizer_notes}></textarea>
@@ -340,6 +360,7 @@
 												<h4 class="font-medium">{event.title}</h4>
 												<p class="text-sm text-muted-foreground">
 													{event.duration_minutes} min
+													· T{event.tier ?? 2}
 													{#if event.kind}· {event.kind}{/if}
 													{#if event.adult_content}· <span class="text-destructive">18+</span>{/if}
 												</p>

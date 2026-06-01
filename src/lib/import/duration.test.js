@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseDuration } from './duration.js';
+import { parseDuration, parseEventTier, parseAutoSchedule } from './duration.js';
 
 describe('parseDuration', () => {
 	it('parses plain hour counts', () => {
@@ -30,5 +30,31 @@ describe('parseDuration', () => {
 	it('requires review for empty or unknown text', () => {
 		expect(parseDuration('').minutes).toBeNull();
 		expect(parseDuration('maybe someday').minutes).toBeNull();
+	});
+});
+
+describe('parseEventTier', () => {
+	it('parses numeric and labeled tiers', () => {
+		expect(parseEventTier('1')).toBe(1);
+		expect(parseEventTier('T2')).toBe(2);
+		expect(parseEventTier('tier 3')).toBe(3);
+	});
+
+	it('defaults to tier 2 when empty or unknown', () => {
+		expect(parseEventTier('')).toBe(2);
+		expect(parseEventTier('wysoki')).toBe(2);
+	});
+});
+
+describe('parseAutoSchedule', () => {
+	it('defaults to enabled', () => {
+		expect(parseAutoSchedule('')).toBe(true);
+		expect(parseAutoSchedule('tak')).toBe(true);
+	});
+
+	it('recognizes disabled values', () => {
+		expect(parseAutoSchedule('nie')).toBe(false);
+		expect(parseAutoSchedule('nie planuj automatycznie')).toBe(false);
+		expect(parseAutoSchedule('manual')).toBe(false);
 	});
 });

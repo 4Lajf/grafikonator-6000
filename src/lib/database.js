@@ -10,6 +10,14 @@ export async function createConvention(data) {
 	return db.createConvention(data);
 }
 
+export async function updateConvention(id, updates) {
+	return db.updateConvention(id, updates);
+}
+
+export async function getConventionDayHours(conventionId) {
+	return db.getConventionDayHours(conventionId);
+}
+
 // People
 export async function getPeople(conventionId) {
 	return db.getPeople(conventionId);
@@ -48,6 +56,10 @@ export async function createRoom(conventionId, data) {
 	return db.createRoom(conventionId, data);
 }
 
+export async function updateRoom(id, updates) {
+	return db.updateRoom(id, updates);
+}
+
 export async function deleteRoom(id) {
 	return db.deleteRoom(id);
 }
@@ -80,6 +92,10 @@ export async function getTimeSlots(conventionId, date = null) {
 
 export async function generateTimeSlots(conventionId) {
 	return db.generateTimeSlotsForConvention(conventionId);
+}
+
+export async function updateTimeSlot(id, updates) {
+	return db.updateTimeSlot(id, updates);
 }
 
 // Availability
@@ -152,6 +168,18 @@ export const TIER_OPTIONS = [
 	{ value: 1, label: 'Mogę (100%)', color: 'bg-green-100 text-green-800 border-green-300' },
 	{ value: 2, label: 'Wolę nie', color: 'bg-yellow-100 text-yellow-800 border-yellow-300' },
 	{ value: 3, label: 'Nie mogę (100%)', color: 'bg-red-100 text-red-800 border-red-300' }
+];
+
+export const EVENT_TIER_OPTIONS = [
+	{ value: 1, label: 'Tier 1 (najwyższy priorytet)' },
+	{ value: 2, label: 'Tier 2 (średni priorytet)' },
+	{ value: 3, label: 'Tier 3 (najniższy priorytet)' }
+];
+
+export const SLOT_TIER_OPTIONS = [
+	{ value: 1, label: 'Tier 1 (najbardziej popularny slot)' },
+	{ value: 2, label: 'Tier 2 (neutralny slot)' },
+	{ value: 3, label: 'Tier 3 (najmniej popularny slot)' }
 ];
 
 export function getTierInfo(tier) {

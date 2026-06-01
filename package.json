@@ -21,6 +21,7 @@
 		"test:watch": "vitest"
 	},
 	"devDependencies": {
+		"@faker-js/faker": "10.4.0",
 		"@internationalized/date": "^3.8.2",
 		"@lucide/svelte": "^0.513.0",
 		"@sveltejs/adapter-auto": "^6.0.0",

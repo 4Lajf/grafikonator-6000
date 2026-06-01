@@ -1,14 +1,28 @@
 import { parseCsv, guessFieldMappings } from './fieldMap.js';
-import { parseDuration, parseYesNo } from './duration.js';
+import { parseDuration, parseYesNo, parseEventTier, parseAutoSchedule } from './duration.js';
 import {
 	expandAvailabilityAnswer,
 	buildConventionDays,
+	buildConventionDaysFromConfig,
 	collectUniqueAvailabilityValues
 } from './valueMap.js';
 import { executeImportFromPreview } from '../local-db.js';
 
 export { parseCsv, guessFieldMappings, collectUniqueAvailabilityValues, buildConventionDays };
 export { APP_FIELDS } from './fieldMap.js';
+
+const DEFAULT_ROOM_NAMES = [
+	'Main Stage',
+	'Auditorium',
+	'Contest Room',
+	'Panel Room A',
+	'Panel Room B',
+	'Panel Room C',
+	'Workshop Room',
+	'Small Club Room',
+	'Open Corridor Zone',
+	'Rhythm Games Zone'
+];
 
 /**
  * @param {Record<string, string>} row
@@ -23,6 +37,22 @@ function mapRow(row, fieldMappings) {
 		}
 	}
 	return mapped;
+}
+
+function parseInteger(value) {
+	const normalized = String(value ?? '').trim().replace(',', '.');
+	if (!normalized) return null;
+	const match = normalized.match(/\d+/);
+	if (!match) return null;
+	const parsed = Number(match[0]);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseList(value) {
+	return String(value ?? '')
+		.split(/[,;\n]/)
+		.map((item) => item.trim())
+		.filter(Boolean);
 }
 
 function rowHash(row) {
@@ -66,19 +96,14 @@ export function previewImport(options) {
 		fieldMappings,
 		conventionConfig,
 		valueMappings = {},
-		roomNames = ['Sala A', 'Sala B', 'Sala C']
+		roomNames = DEFAULT_ROOM_NAMES
 	} = options;
 
 	const { headers, rows } = parseCsv(csvText);
 	const guessed = guessFieldMappings(headers);
 	const mappings =
 		fieldMappings && Object.keys(fieldMappings).length > 0 ? fieldMappings : guessed.mappings;
-	const conventionDays = buildConventionDays(
-		conventionConfig.startDate,
-		conventionConfig.endDate,
-		conventionConfig.dayStartHour ?? 8,
-		conventionConfig.dayEndHour ?? 22
-	);
+	const conventionDays = buildConventionDaysFromConfig(conventionConfig);
 
 	/** @type {Map<string, { display_name: string, events: object[] }>} */
 	const peopleMap = new Map();
@@ -157,15 +182,20 @@ export function previewImport(options) {
 
 		peopleMap.get(displayName).events.push({
 			title,
-			kind: mapped.kind || null,
+			kind: mapped.kind?.trim() || null,
 			duration_minutes: duration.minutes,
 			duration_raw: mapped.duration?.trim() || '',
 			needs_duration_edit: needsDurationEdit,
 			description: mapped.description || null,
 			organizer_notes: mapped.organizer_notes || null,
+			tier: parseEventTier(mapped.event_tier),
+			auto_schedule: parseAutoSchedule(mapped.auto_schedule),
 			adult_content: parseYesNo(mapped.adult_content),
 			needs_laptop: /potrzebuj/i.test(mapped.needs_laptop || ''),
 			needs_speakers: /potrzebuj/i.test(mapped.needs_speakers || ''),
+			estimated_attendance: parseInteger(mapped.estimated_attendance),
+			required_room_tags: parseList(mapped.required_room_tags),
+			equipment_needs: parseList(mapped.equipment_needs),
 			availability: expanded,
 			source_row_hash: rowHash(row)
 		});

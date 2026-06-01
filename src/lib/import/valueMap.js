@@ -55,4 +55,29 @@ export function buildConventionDays(startDate, endDate, startHour, endHour) {
 	return days;
 }
 
+/**
+ * @param {{
+ *   startDate: string,
+ *   endDate: string,
+ *   daySettings?: { date: string, startHour?: number, endHour?: number, start_hour?: number, end_hour?: number }[]
+ * }} conventionConfig
+ */
+export function buildConventionDaysFromConfig(conventionConfig) {
+	const baseDays = buildConventionDays(conventionConfig.startDate, conventionConfig.endDate, 8, 22);
+	const byDate = new Map(
+		(conventionConfig.daySettings || []).map((entry) => [
+			entry.date,
+			{
+				start: `${String(entry.startHour ?? entry.start_hour ?? 8).padStart(2, '0')}:00:00`,
+				end: `${String(entry.endHour ?? entry.end_hour ?? 22).padStart(2, '0')}:00:00`
+			}
+		])
+	);
+	return baseDays.map((day) => ({
+		...day,
+		start: byDate.get(day.date)?.start ?? day.start,
+		end: byDate.get(day.date)?.end ?? day.end
+	}));
+}
+
 export { POLISH_MONTHS } from './availabilityParser.js';

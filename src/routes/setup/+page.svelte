@@ -4,7 +4,9 @@
 		getImportFields,
 		previewImport,
 		executeImport,
-		createManualConvention
+		createManualConvention,
+		EVENT_TIER_OPTIONS,
+		SLOT_TIER_OPTIONS
 	} from '$lib/database.js';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Card from '$lib/components/ui/card/card.svelte';
@@ -34,12 +36,12 @@
 		startDate: '2026-09-30',
 		endDate: '2026-10-01',
 		slotMinutes: 30,
-		dayStartHour: 0,
-		dayEndHour: 24
+		daySettings: [],
+		slotTierSettings: []
 	});
 
 	let roomNames = $state(
-		'Main Stage\nAuditorium\nWorkshop Room A\nWorkshop Room B'
+		'Main Stage\nAuditorium\nContest Room\nPanel Room A\nPanel Room B\nPanel Room C\nWorkshop Room\nSmall Club Room\nOpen Corridor Zone\nRhythm Games Zone'
 	);
 	let valueMappings = $state({});
 	let unmappedHeaders = $state([]);
@@ -47,9 +49,147 @@
 	let manualEntries = $state([
 		{
 			display_name: '',
-			events: [{ title: '', duration_minutes: 60 }]
+			events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
 		}
 	]);
+
+	function listDates(startDate, endDate) {
+		if (!startDate || !endDate || startDate > endDate) return [];
+		const dates = [];
+		const current = new Date(`${startDate}T00:00:00`);
+		const end = new Date(`${endDate}T00:00:00`);
+		while (current <= end) {
+			const y = current.getFullYear();
+			const m = String(current.getMonth() + 1).padStart(2, '0');
+			const d = String(current.getDate()).padStart(2, '0');
+			dates.push(`${y}-${m}-${d}`);
+			current.setDate(current.getDate() + 1);
+		}
+		return dates;
+	}
+
+	function syncDaySettings() {
+		const dates = listDates(conventionConfig.startDate, conventionConfig.endDate);
+		const existing = new Map((conventionConfig.daySettings || []).map((day) => [day.date, day]));
+		/** @type {{ date: string, startHour: number, endHour: number }[]} */
+		const next = [];
+		for (const date of dates) {
+			const day = existing.get(date);
+			if (day) {
+				next.push({ date, startHour: Number(day.startHour), endHour: Number(day.endHour) });
+			} else if (next.length > 0) {
+				const prev = next[next.length - 1];
+				next.push({ date, startHour: prev.startHour, endHour: prev.endHour });
+			} else {
+				next.push({ date, startHour: 8, endHour: 22 });
+			}
+		}
+		const currentJson = JSON.stringify(conventionConfig.daySettings || []);
+		const nextJson = JSON.stringify(next);
+		if (currentJson !== nextJson) {
+			conventionConfig = { ...conventionConfig, daySettings: next };
+		}
+	}
+
+	function formatDaySettingDate(dateStr) {
+		const date = new Date(`${dateStr}T00:00:00`);
+		return date.toLocaleDateString('pl-PL', { weekday: 'long', day: 'numeric', month: 'short' });
+	}
+
+	function updateDaySetting(date, key, value) {
+		const parsed = Number(value);
+		conventionConfig = {
+			...conventionConfig,
+			daySettings: (conventionConfig.daySettings || []).map((day) =>
+				day.date === date ? { ...day, [key]: Number.isFinite(parsed) ? parsed : day[key] } : day
+			)
+		};
+	}
+
+	function listSlotsForDay(day) {
+		const slots = [];
+		const slotMinutes = Number(conventionConfig.slotMinutes) || 30;
+		const start = Number(day.startHour) * 60;
+		const end = Number(day.endHour) * 60;
+		for (let total = start; total < end; total += slotMinutes) {
+			const h = Math.floor(total / 60);
+			const m = total % 60;
+			slots.push({
+				date: day.date,
+				startTime: `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`
+			});
+		}
+		return slots;
+	}
+
+	function defaultSlotTierForStartTime(startTime) {
+		const hour = Number(String(startTime || '00:00').slice(0, 2));
+		if (hour >= 16 && hour < 19) return 1;
+		if (hour < 10 || hour >= 21) return 3;
+		return 2;
+	}
+
+	function syncSlotTierSettings() {
+		const existing = new Map(
+			(conventionConfig.slotTierSettings || []).map((slot) => [
+				`${slot.date}|${slot.startTime}`,
+				slot
+			])
+		);
+		const next = (conventionConfig.daySettings || []).flatMap((day) =>
+			listSlotsForDay(day).map((slot) => {
+				const current = existing.get(`${slot.date}|${slot.startTime}`);
+				return {
+					...slot,
+					tier: Number(current?.tier ?? defaultSlotTierForStartTime(slot.startTime))
+				};
+			})
+		);
+		const currentJson = JSON.stringify(conventionConfig.slotTierSettings || []);
+		const nextJson = JSON.stringify(next);
+		if (currentJson !== nextJson) {
+			conventionConfig = { ...conventionConfig, slotTierSettings: next };
+		}
+	}
+
+	function slotsByDayForSetup() {
+		const grouped = new Map();
+		for (const slot of conventionConfig.slotTierSettings || []) {
+			if (!grouped.has(slot.date)) grouped.set(slot.date, []);
+			grouped.get(slot.date).push(slot);
+		}
+		return [...grouped.entries()].map(([date, slots]) => ({
+			date,
+			slots: slots.sort((a, b) => a.startTime.localeCompare(b.startTime))
+		}));
+	}
+
+	function updateSlotTierSetting(date, startTime, tier) {
+		conventionConfig = {
+			...conventionConfig,
+			slotTierSettings: (conventionConfig.slotTierSettings || []).map((slot) =>
+				slot.date === date && slot.startTime === startTime
+					? { ...slot, tier: Number(tier) }
+					: slot
+			)
+		};
+	}
+
+	function cycleSlotTierSetting(slot) {
+		const current = Number(slot.tier ?? 2);
+		updateSlotTierSetting(slot.date, slot.startTime, current === 3 ? 1 : current + 1);
+	}
+
+	function getSlotTierClass(tier) {
+		const t = Number(tier ?? 2);
+		if (t === 1) return 'g-tier-1 hover:brightness-95 border-[#34a853]';
+		if (t === 3) return 'g-tier-3 hover:brightness-95 border-[#ea4335]';
+		return 'g-tier-2 hover:brightness-95 border-[#fbbc04]';
+	}
+
+	function formatSlotStart(timeStr) {
+		return String(timeStr || '').slice(0, 5);
+	}
 
 	onMount(async () => {
 		const data = await getImportFields();
@@ -74,7 +214,7 @@
 		manualEntries = [
 			{
 				display_name: '',
-				events: [{ title: '', duration_minutes: 60 }]
+				events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
 			}
 		];
 	}
@@ -177,12 +317,15 @@
 	function addPerson() {
 		manualEntries = [
 			...manualEntries,
-			{ display_name: '', events: [{ title: '', duration_minutes: 60 }] }
+			{ display_name: '', events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }] }
 		];
 	}
 
 	function removePerson(index) {
 		if (manualEntries.length <= 1) return;
+		const displayName = manualEntries[index]?.display_name?.trim();
+		const label = displayName ? `„${displayName}”` : `osobę nr ${index + 1}`;
+		if (!confirm(`Usunąć ${label} wraz z atrakcjami?`)) return;
 		manualEntries = manualEntries.filter((_, i) => i !== index);
 	}
 
@@ -191,7 +334,7 @@
 			i === personIndex
 				? {
 						...person,
-						events: [...person.events, { title: '', duration_minutes: 60 }]
+						events: [...person.events, { title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
 					}
 				: person
 		);
@@ -230,6 +373,18 @@
 			toast.error('Data początku nie może być po dacie końca');
 			return false;
 		}
+		for (const day of conventionConfig.daySettings || []) {
+			if (
+				Number(day.startHour) < 0 ||
+				Number(day.startHour) > 23 ||
+				Number(day.endHour) < 1 ||
+				Number(day.endHour) > 24 ||
+				Number(day.startHour) >= Number(day.endHour)
+			) {
+				toast.error(`Nieprawidłowe godziny dla dnia ${day.date}`);
+				return false;
+			}
+		}
 		if (parsedRoomNames().length === 0) {
 			toast.error('Dodaj co najmniej jedną salę');
 			return false;
@@ -249,6 +404,19 @@
 		}
 		return true;
 	}
+
+	$effect(() => {
+		conventionConfig.startDate;
+		conventionConfig.endDate;
+		conventionConfig.slotMinutes;
+		syncDaySettings();
+	});
+
+	$effect(() => {
+		conventionConfig.daySettings;
+		conventionConfig.slotMinutes;
+		syncSlotTierSettings();
+	});
 
 	$effect(() => {
 		if (mode === 'manual') {
@@ -272,7 +440,8 @@
 			...person,
 			events: person.events.map((event) => ({
 				...event,
-				duration_minutes: event.duration_minutes ?? ''
+				duration_minutes: event.duration_minutes ?? '',
+				auto_schedule: event.auto_schedule !== false && event.auto_schedule !== 0
 			}))
 		}));
 	}
@@ -341,7 +510,9 @@
 				events: person.events.map((event) => ({
 					...event,
 					title: event.title.trim(),
-					duration_minutes: Number(event.duration_minutes)
+					duration_minutes: Number(event.duration_minutes),
+					tier: Number(event.tier ?? 2),
+					auto_schedule: event.auto_schedule !== false && event.auto_schedule !== 0
 				}))
 			}))
 			.filter((person) => person.events.length > 0);
@@ -516,25 +687,100 @@
 						<Label for="end-date">Data końca</Label>
 						<Input id="end-date" type="date" bind:value={conventionConfig.endDate} />
 					</div>
-					<div>
-						<Label for="day-start">Początek dnia (godz.)</Label>
-						<Input
-							id="day-start"
-							type="number"
-							min="0"
-							max="23"
-							bind:value={conventionConfig.dayStartHour}
-						/>
+					<div class="col-span-2 space-y-2">
+						<div>
+							<p class="text-sm font-medium text-foreground">Godziny per dzień</p>
+							<p class="text-xs text-muted-foreground">
+								Każdy dzień może mieć inny przedział godzin slotów.
+							</p>
+						</div>
+						<div class="overflow-hidden rounded-lg border border-border">
+							<div
+								class="grid grid-cols-[1fr_auto] items-center gap-3 bg-muted/60 px-3 py-2 text-xs font-medium text-muted-foreground"
+							>
+								<span>Dzień</span>
+								<span class="w-[150px] text-center">Godziny (od–do)</span>
+							</div>
+							{#each conventionConfig.daySettings as day}
+								<div
+									class="grid grid-cols-[1fr_auto] items-center gap-3 border-t border-border px-3 py-2 even:bg-muted/20"
+								>
+									<span class="text-sm capitalize text-foreground">
+										{formatDaySettingDate(day.date)}
+									</span>
+									<div class="flex w-[150px] items-center justify-center gap-1.5">
+										<Input
+											class="h-8 w-16 text-center tabular-nums"
+											type="number"
+											min="0"
+											max="23"
+											aria-label="Początek dnia {day.date}"
+											value={day.startHour}
+											oninput={(event) =>
+												updateDaySetting(day.date, 'startHour', event.currentTarget.value)}
+										/>
+										<span class="text-muted-foreground">–</span>
+										<Input
+											class="h-8 w-16 text-center tabular-nums"
+											type="number"
+											min="1"
+											max="24"
+											aria-label="Koniec dnia {day.date}"
+											value={day.endHour}
+											oninput={(event) =>
+												updateDaySetting(day.date, 'endHour', event.currentTarget.value)}
+										/>
+									</div>
+								</div>
+							{/each}
+						</div>
 					</div>
-					<div>
-						<Label for="day-end">Koniec dnia (godz.)</Label>
-						<Input
-							id="day-end"
-							type="number"
-							min="1"
-							max="24"
-							bind:value={conventionConfig.dayEndHour}
-						/>
+					<div class="col-span-2 space-y-2">
+						<div>
+							<p class="text-sm font-medium text-foreground">Popularność godzin (hype slotów)</p>
+							<p class="text-xs text-muted-foreground">
+								Ustaw tier slotów już przed importem. Kliknięcie slotu zmienia T1 → T2 → T3.
+							</p>
+						</div>
+						<div class="flex flex-wrap gap-4 text-xs text-muted-foreground">
+							<span class="flex items-center gap-1">
+								<span class="g-tier-1 h-3 w-3 rounded border border-[#34a853]"></span>
+								T1 hype
+							</span>
+							<span class="flex items-center gap-1">
+								<span class="g-tier-2 h-3 w-3 rounded border border-[#fbbc04]"></span>
+								T2 neutralny
+							</span>
+							<span class="flex items-center gap-1">
+								<span class="g-tier-3 h-3 w-3 rounded border border-[#ea4335]"></span>
+								T3 spokojny
+							</span>
+						</div>
+						<div class="space-y-3 rounded-lg border border-border p-3">
+							{#each slotsByDayForSetup() as day}
+								<div>
+									<h3 class="mb-2 text-sm font-medium capitalize">
+										{formatDaySettingDate(day.date)}
+									</h3>
+									<div class="flex flex-wrap gap-1">
+										{#each day.slots as slot}
+											<button
+												type="button"
+												class="rounded border px-2 py-1 text-xs transition-colors {getSlotTierClass(
+													slot.tier
+												)}"
+												title="{formatSlotStart(slot.startTime)}: {SLOT_TIER_OPTIONS.find(
+													(t) => t.value === Number(slot.tier ?? 2)
+												)?.label}"
+												onclick={() => cycleSlotTierSetting(slot)}
+											>
+												{formatSlotStart(slot.startTime)}
+											</button>
+										{/each}
+									</div>
+								</div>
+							{/each}
+						</div>
 					</div>
 				</div>
 				<div>
@@ -590,7 +836,7 @@
 								</div>
 								{#if manualEntries.length > 1}
 									<Button
-										variant="outline"
+										variant="destructive"
 										size="sm"
 										class="mt-6"
 										onclick={() => removePerson(personIndex)}
@@ -602,7 +848,7 @@
 
 							<div class="space-y-3">
 								{#each person.events as event, eventIndex}
-									<div class="grid grid-cols-1 md:grid-cols-3 gap-3 items-end bg-white rounded p-3">
+									<div class="grid grid-cols-1 gap-3 items-end rounded bg-white p-3 md:grid-cols-5">
 										<div class="md:col-span-2">
 											<Label for="title-{personIndex}-{eventIndex}">Tytuł atrakcji</Label>
 											<Input
@@ -621,8 +867,29 @@
 												bind:value={event.duration_minutes}
 											/>
 										</div>
+										<div>
+											<Label for="tier-{personIndex}-{eventIndex}">Tier atrakcji</Label>
+											<select
+												id="tier-{personIndex}-{eventIndex}"
+												class="g-select"
+												bind:value={event.tier}
+											>
+												{#each EVENT_TIER_OPTIONS as tier}
+													<option value={tier.value}>{tier.label}</option>
+												{/each}
+											</select>
+										</div>
+										<label
+											class="flex min-h-10 items-center gap-2 rounded border border-border px-3 py-2 text-sm"
+										>
+											<input
+												type="checkbox"
+												bind:checked={event.auto_schedule}
+											/>
+											<span>Auto-plan</span>
+										</label>
 										{#if person.events.length > 1}
-											<div class="md:col-span-3">
+											<div class="md:col-span-5">
 												<Button
 													variant="outline"
 													size="sm"
@@ -734,6 +1001,8 @@
 								<th class="text-left p-2 w-28">Prowadzący</th>
 								<th class="text-left p-2">Tytuł</th>
 								<th class="text-left p-2 w-24">Min</th>
+								<th class="text-left p-2 w-44">Hype</th>
+								<th class="text-left p-2 w-28">Auto-plan</th>
 								<th class="text-right p-2 w-28">Akcje</th>
 							</tr>
 						</thead>
@@ -767,6 +1036,19 @@
 												title={event.duration_raw ? `Z CSV: ${event.duration_raw}` : undefined}
 												oninput={(e) => updateEventDuration(event, e.currentTarget.value)}
 											/>
+										</td>
+										<td class="p-2">
+											<select class="g-select text-sm" bind:value={event.tier}>
+												{#each EVENT_TIER_OPTIONS as tier}
+													<option value={tier.value}>{tier.label}</option>
+												{/each}
+											</select>
+										</td>
+										<td class="p-2 align-middle">
+											<label class="inline-flex items-center gap-2 text-xs text-muted-foreground">
+												<input type="checkbox" bind:checked={event.auto_schedule} />
+												<span>tak</span>
+											</label>
 										</td>
 										<td class="p-2 text-right align-middle whitespace-nowrap">
 											<Button
@@ -843,7 +1125,7 @@
 														{truncateTitle(event.title)}
 													</span>
 													<span class="text-muted-foreground/70 text-xs whitespace-nowrap">
-														· {event.duration_minutes} min
+														· {event.duration_minutes} min · T{event.tier ?? 2}
 													</span>
 												</li>
 											{/each}

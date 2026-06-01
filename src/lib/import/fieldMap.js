@@ -39,12 +39,13 @@ const SKIP_PATTERNS = [
 	/sygnatura czasowa|timestamp|data wysłania|data wyslania|czas wypełnienia/i,
 	/^email$|e-mail|adres e-mail/i,
 	/nocleg|zakwaterowanie|hotel|accommodation/i,
+	/preferowane tagi sali|preferred room tags/i,
 	/potrzebuj.*laptop|potrzebuj.*głośnik|potrzebuj.*glosnik/i,
-	/laptop|głośnik|glosnik|projektor|rzutnik|mikrofon|nagłośnienie|naglosnienie/i,
+	/wymagane wyposażenie|wymagane wyposazenie|potrzebne wyposażenie|potrzebne wyposazenie/i,
+	/equipment needs|required equipment|equipment/i,
 	/doświadczenie|doswiadczenie|referencje|portfolio|experience/i,
 	/inne uwagi|uwagi dodatkowe|miejsce na.*uwag|komentarz|comments|remarks/i,
 	/opis atrakcji|opis.*uczestnik|opis.*organizator|streszczenie|abstract|summary/i,
-	/rodzaj atrakcji|typ atrakcji|forma atrakcji|kind|category|format/i,
 	/treści dla dorosłych|tresci dla doroslych|18\+|nsfw|dla dorosłych|dla doroslych/i,
 	/telefon|phone|tel\.|mobile|komórka|komorka/i
 ];
@@ -92,6 +93,45 @@ const FIELD_RULES = [
 			/godziny.*(pasuj|dyspozyc)/i,
 			/availability|dostępność|dostepnosc/i,
 			/termin(y)?/i
+		]
+	},
+	{
+		field: 'event_tier',
+		priority: 10,
+		patterns: [
+			/priorytet atrakcji|tier atrakcji|tier\s*\(?\s*1/i,
+			/priority|event tier|hype|popularność atrakcji|popularnosc atrakcji/i
+		]
+	},
+	{
+		field: 'auto_schedule',
+		priority: 10,
+		patterns: [
+			/auto[-\s]?plan|auto[-\s]?schedule|planowanie automatyczne/i,
+			/nie planuj automatycznie|planować automatycznie|planowac automatycznie/i
+		]
+	},
+	{
+		field: 'estimated_attendance',
+		priority: 10,
+		patterns: [
+			/szacowana frekwencja|przewidywana frekwencja|liczba uczestników|liczba uczestnikow/i,
+			/estimated attendance|expected attendance|capacity need/i
+		]
+	},
+	{
+		field: 'required_room_tags',
+		priority: 10,
+		patterns: [
+			/wymagane tagi sali|wymagane.*sali|required room tags|required tags/i
+		]
+	},
+	{
+		field: 'kind',
+		priority: 10,
+		patterns: [
+			/rodzaj atrakcji|typ atrakcji|forma atrakcji/i,
+			/^kind$|event type|category|format/i
 		]
 	}
 ];
@@ -167,5 +207,10 @@ export const APP_FIELDS = [
 	{ key: 'title', label: 'Tytuł atrakcji' },
 	{ key: 'duration', label: 'Czas trwania atrakcji' },
 	{ key: 'availability', label: 'Dyspozycyjność' },
+	{ key: 'event_tier', label: 'Priorytet atrakcji (tier)' },
+	{ key: 'estimated_attendance', label: 'Szacowana frekwencja' },
+	{ key: 'required_room_tags', label: 'Wymagane tagi sali' },
+	{ key: 'kind', label: 'Typ atrakcji' },
+	{ key: 'auto_schedule', label: 'Auto-planowanie' },
 	{ key: '_skip', label: '(pomiń kolumnę)' }
 ];

@@ -7,6 +7,7 @@
 
 	const navLinks = [
 		{ href: '/setup', label: 'Import' },
+		{ href: '/convention', label: 'Konwent' },
 		{ href: '/people', label: 'Osoby' },
 		{ href: '/schedule', label: 'Grafik' }
 	];

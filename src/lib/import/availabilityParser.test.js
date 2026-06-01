@@ -254,7 +254,7 @@ describe('guessFieldMappings — header synonyms', () => {
 		expect(mappings['Dyspozycyjność (preferowane godziny trwania atrakcji)']).toBe(
 			'availability'
 		);
-		expect(mappings['Rodzaj atrakcji']).toBe('_skip');
+		expect(mappings['Rodzaj atrakcji']).toBe('kind');
 		expect(mappings['Czy potrzebujesz laptopa?']).toBe('_skip');
 		expect(mappings['Czy potrzebujesz głośników?']).toBe('_skip');
 		expect(mappings['Czy potrzebujesz noclegu?']).toBe('_skip');
