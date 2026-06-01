@@ -1,0 +1,3 @@
+-- LEGACY: Supabase/PostgreSQL schema from the old shift-rota model.
+-- The app now uses SQLite with convention/event scheduling.
+-- See src/lib/server/schema.sql for the current schema.

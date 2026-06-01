@@ -1,0 +1,6 @@
+3+page.svelte:267 Uncaught (in promise) DataCloneError: Failed to execute 'structuredClone' on 'Window': [object Array] could not be cloned.
+    at syncEditablePeople (+page.svelte:267:20)
+    at +page.svelte:530:8Understand this error
+3+page.svelte:267 Uncaught (in promise) DataCloneError: Failed to execute 'structuredClone' on 'Window': [object Array] could not be cloned.
+    at syncEditablePeople (+page.svelte:267:20)
+    at +page.svelte:530:8
