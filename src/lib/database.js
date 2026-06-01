@@ -163,6 +163,16 @@ export async function createManualConvention(data) {
 	return db.createManualConvention(data);
 }
 
+export async function exportPlan() {
+	return db.exportPlanJson();
+}
+
+export async function importPlan(jsonString) {
+	return db.importPlanJson(jsonString);
+}
+
+export { buildPlanFilename, describePlan, parsePlanJson } from './plan-io.js';
+
 // Tier labels
 export const TIER_OPTIONS = [
 	{ value: 1, label: 'Mogę (100%)', color: 'bg-green-100 text-green-800 border-green-300' },

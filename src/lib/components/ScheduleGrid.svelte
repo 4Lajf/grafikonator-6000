@@ -15,8 +15,9 @@
 	} from '$lib/database.js';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Card from '$lib/components/ui/card/card.svelte';
+	import Input from '$lib/components/ui/input/input.svelte';
 	import { toast } from 'svelte-sonner';
-	import { CircleAlert, TriangleAlert, ArrowUpDown, Lock } from 'lucide-svelte';
+	import { CircleAlert, TriangleAlert, ArrowUpDown, Lock, Search, X } from 'lucide-svelte';
 	import ScheduleEventPanel from '$lib/components/ScheduleEventPanel.svelte';
 
 	function waitForPaint() {
@@ -39,6 +40,9 @@
 	let unscheduled = $state([]);
 	/** @type {'none' | 'asc' | 'desc'} */
 	let unscheduledSort = $state('none');
+	/** @type {'all' | 'unscheduled' | 'scheduled'} */
+	let sidebarFilter = $state('unscheduled');
+	let eventSearchQuery = $state('');
 	let availability = $state([]);
 	let loading = $state(true);
 	let autoScheduling = $state(false);
@@ -67,7 +71,7 @@
 	const TIME_COL_WIDTH = 56;
 	const ROOM_COL_WIDTH_BASE = 240;
 	const ROOM_COL_WIDTH_HOURLY = 300;
-	const SLOT_HEIGHT = 30;
+	const SLOT_HEIGHT = $derived((convention?.slot_minutes ?? 30) >= 60 ? 56 : 52);
 	const DRAG_THRESHOLD = 5;
 	const PREVIEW_SCHEDULE_ID = '__preview__';
 	const CHAIN_SWAP_MAX_DEPTH = 5;
@@ -113,14 +117,101 @@
 
 	const OK_TILE_COLORS = TIER_COLORS[1];
 
-	const displayedUnscheduled = $derived.by(() => {
-		const list = [...unscheduled];
-		if (unscheduledSort === 'asc') {
-			list.sort((a, b) => Number(a.tier ?? 2) - Number(b.tier ?? 2));
-		} else if (unscheduledSort === 'desc') {
-			list.sort((a, b) => Number(b.tier ?? 2) - Number(a.tier ?? 2));
+	const normalizedEventSearch = $derived(eventSearchQuery.trim().toLowerCase());
+	const eventSearchActive = $derived(normalizedEventSearch.length > 0);
+	const tagSearchActive = $derived(normalizedEventSearch.startsWith('tag:'));
+	const tagSearchValue = $derived(tagSearchActive ? normalizedEventSearch.slice(4).trim() : '');
+	const searchPlaceholder = $derived('Szukaj albo wpisz tag:jojo');
+
+	const allEventTags = $derived.by(() => {
+		const tags = new Map();
+		for (const event of unscheduled) {
+			for (const tag of getEventTags(event)) tags.set(tag.toLowerCase(), tag);
 		}
-		return list;
+		for (const schedule of schedules) {
+			for (const tag of getEventTags(schedule.event)) tags.set(tag.toLowerCase(), tag);
+		}
+		return [...tags.values()].sort((a, b) => a.localeCompare(b, 'pl'));
+	});
+
+	function eventSearchHaystack(event, schedule = null) {
+		const parts = [
+			event?.title,
+			hostLabel(event),
+			...(getEventTags(event) ?? []),
+			event?.organizer_notes,
+			schedule?.room?.name,
+			schedule?.host_name,
+			schedule?.start_slot?.date,
+			schedule?.start_slot?.start_time ? formatTime(schedule.start_slot.start_time) : ''
+		];
+		return parts.filter(Boolean).join(' ').toLowerCase();
+	}
+
+	function matchesEventSearch(event, schedule = null, query = normalizedEventSearch) {
+		if (!query) return true;
+		if (query.startsWith('tag:')) {
+			const tagQuery = query.slice(4).trim();
+			if (!tagQuery) return false;
+			return getEventTags(event).some((tag) => tag.toLowerCase() === tagQuery);
+		}
+		const haystack = eventSearchHaystack(event, schedule);
+		return query.split(/\s+/).every((token) => haystack.includes(token));
+	}
+
+	const matchingScheduleIds = $derived.by(() => {
+		if (!eventSearchActive) return null;
+		const ids = new Set();
+		for (const schedule of schedules) {
+			if (matchesEventSearch(schedule.event, schedule)) ids.add(schedule.id);
+		}
+		return ids;
+	});
+
+	const displayedSidebarItems = $derived.by(() => {
+		const filter = eventSearchActive ? 'all' : sidebarFilter;
+		/** @type {{ kind: 'unscheduled' | 'scheduled', event: any, schedule: any | null, key: string }[]} */
+		let items = [];
+
+		if (filter === 'unscheduled' || filter === 'all') {
+			for (const event of unscheduled) {
+				items.push({
+					kind: 'unscheduled',
+					event,
+					schedule: null,
+					key: `u-${event.id}`
+				});
+			}
+		}
+
+		if (filter === 'scheduled' || filter === 'all') {
+			for (const schedule of schedules) {
+				items.push({
+					kind: 'scheduled',
+					event: schedule.event,
+					schedule,
+					key: `s-${schedule.id}`
+				});
+			}
+		}
+
+		if (eventSearchActive) {
+			items = items.filter((item) => matchesEventSearch(item.event, item.schedule));
+		}
+
+		if (unscheduledSort !== 'none') {
+			items.sort((a, b) => {
+				const tierA = Number(a.event.tier ?? 2);
+				const tierB = Number(b.event.tier ?? 2);
+				return unscheduledSort === 'asc' ? tierA - tierB : tierB - tierA;
+			});
+		} else {
+			items.sort((a, b) =>
+				String(a.event.title || '').localeCompare(String(b.event.title || ''), 'pl')
+			);
+		}
+
+		return items;
 	});
 
 	const unscheduledSortTitle = $derived(
@@ -217,6 +308,23 @@
 			unscheduledSort === 'none' ? 'asc' : unscheduledSort === 'asc' ? 'desc' : 'none';
 	}
 
+	function clearEventSearch() {
+		eventSearchQuery = '';
+	}
+
+	function handleSidebarItemClick(event, item, anchorEl) {
+		if (blockNextClick || dragState?.moved) {
+			blockNextClick = false;
+			return;
+		}
+		event.stopPropagation();
+		if (item.kind === 'scheduled') {
+			openEventPanel(item.schedule, anchorEl);
+			return;
+		}
+		openUnscheduledPanel(item.event, anchorEl);
+	}
+
 	function isHourStart(timeStr) {
 		return formatTime(timeStr).endsWith(':00');
 	}
@@ -250,12 +358,16 @@
 		return formatTime(endSlot?.end_time);
 	}
 
-	const TILE_META_HEIGHT = 22;
+	const TILE_META_HEIGHT = 28;
 	const TILE_TITLE_LINE_HEIGHT = 16;
-	const TILE_VERTICAL_PADDING = 6;
+	const TILE_VERTICAL_PADDING = 8;
 
 	function getSlotTileHeight(slotCount) {
 		return slotCount * SLOT_HEIGHT - 2;
+	}
+
+	function isCompactTile(slotCount) {
+		return getSlotTileHeight(slotCount) < 68;
 	}
 
 	function getMaxTitleLines(slotCount) {
@@ -291,6 +403,31 @@
 			.filter(Boolean);
 	}
 
+	function getEventTags(event) {
+		const seen = new Set();
+		const tags = [];
+		for (const tag of [...normalizeTagList(event?.event_tags), ...normalizeTagList(event?.required_room_tags)]) {
+			const key = tag.toLowerCase();
+			if (seen.has(key)) continue;
+			seen.add(key);
+			tags.push(tag);
+		}
+		return tags;
+	}
+
+	function getEventTagGapSlotCount() {
+		const slotMinutes = Number(convention?.slot_minutes) || 60;
+		return Math.max(1, Math.ceil(60 / slotMinutes));
+	}
+
+	function tagEntriesTooClose(a, b) {
+		if (!a || !b) return false;
+		const requiredGap = Math.max(a.gapSlots ?? 1, b.gapSlots ?? 1);
+		const aEnd = a.startIdx + a.slotCount;
+		const bEnd = b.startIdx + b.slotCount;
+		return a.startIdx < bEnd + requiredGap && b.startIdx < aEnd + requiredGap;
+	}
+
 	const ROOM_TAG_LABELS = {
 		main_stage: 'Scena główna',
 		loud_audio: 'Głośne audio',
@@ -322,6 +459,15 @@
 		return normalizeTagList(room?.capabilities?.tags);
 	}
 
+	function getRoomTagVocabulary() {
+		return new Set(rooms.flatMap((room) => getRoomTags(room).map((tag) => tag.toLowerCase())));
+	}
+
+	function getEventRoomRequiredTags(event) {
+		const roomTagVocabulary = getRoomTagVocabulary();
+		return getEventTags(event).filter((tag) => roomTagVocabulary.has(tag.toLowerCase()));
+	}
+
 	function formatRoomHeaderName(room) {
 		const capacity = Number(room?.capabilities?.capacity);
 		if (Number.isFinite(capacity) && capacity > 0) {
@@ -343,9 +489,9 @@
 		if (!room || !schedule?.event) return [];
 
 		const fitIssues = [];
-		const roomTags = new Set(getRoomTags(room));
-		const requiredTags = normalizeTagList(schedule.event.required_room_tags);
-		const missingTags = requiredTags.filter((tag) => !roomTags.has(tag));
+		const roomTags = new Set(getRoomTags(room).map((tag) => tag.toLowerCase()));
+		const requiredTags = getEventRoomRequiredTags(schedule.event);
+		const missingTags = requiredTags.filter((tag) => !roomTags.has(tag.toLowerCase()));
 		if (missingTags.length > 0) {
 			fitIssues.push({
 				severity: SEVERITY.ERROR,
@@ -524,6 +670,16 @@
 
 	function issueKey(issue) {
 		return `${issue.severity}|${issue.message}|${issue.scheduleId ?? ''}|${issue.personId ?? ''}`;
+	}
+
+	function getNewIssues(checkedIssues, baselineIssueKeys = new Set(issues.map(issueKey))) {
+		return checkedIssues.filter((issue) => !baselineIssueKeys.has(issueKey(issue)));
+	}
+
+	function getRelevantNewIssues(checkedIssues, movedIds, fallbackScheduleId = null) {
+		return getNewIssues(checkedIssues).filter((issue) =>
+			movedIds.has(issue.scheduleId ?? fallbackScheduleId)
+		);
 	}
 
 	function getSchedulePlacement(schedule) {
@@ -743,8 +899,7 @@
 		const finalIssues = collectHypotheticalIssues(
 			buildHypotheticalSchedulesForAssignments(assignments)
 		);
-		const isGenerated = (issue) =>
-			changedIds.has(issue.scheduleId) || !baselineIssueKeys.has(issueKey(issue));
+		const isGenerated = (issue) => !baselineIssueKeys.has(issueKey(issue));
 
 		if (finalIssues.some((issue) => issue.severity === SEVERITY.ERROR && isGenerated(issue))) {
 			return null;
@@ -1162,9 +1317,7 @@
 
 		const { schedules: hyp, movedIds } = buildHypotheticalDropResult(item, target);
 		const previewId = getPreviewScheduleId(item);
-		const previewIssues = collectHypotheticalIssues(hyp).filter((issue) =>
-			movedIds.has(issue.scheduleId ?? previewId)
-		);
+		const previewIssues = getRelevantNewIssues(collectHypotheticalIssues(hyp), movedIds, previewId);
 		const tier = Math.max(
 			1,
 			...hyp
@@ -1179,9 +1332,12 @@
 		if (!target) return null;
 		const plan = buildDirectDropPlan(item, target);
 		const previewTarget = plan?.target ?? target;
+		const isDirectSwap = (plan?.moves?.length ?? 0) > 1;
 		return {
 			...previewTarget,
-			appearance: getCachedDropPreviewAppearance(item, previewTarget)
+			appearance: isDirectSwap
+				? getDropPreviewAppearance(item, previewTarget)
+				: getCachedDropPreviewAppearance(item, previewTarget)
 		};
 	}
 
@@ -1296,6 +1452,8 @@
 		const personScheduleSequence = new Map();
 		const roomSlotMap = new Map();
 		const roomScheduleSequence = new Map();
+		const tagEntriesByTag = new Map();
+		const reportedTagConflicts = new Set();
 
 		for (const sched of daySchedules) {
 			const hostIds = getHostIds(sched);
@@ -1377,6 +1535,37 @@
 				}
 
 				personScheduleSequence.get(hostId).push({ sched, startIdx, roomId: sched.room_id });
+			}
+
+			if (startIdx < 0) continue;
+			for (const tag of getEventTags(sched.event)) {
+				const normalizedTag = tag.toLowerCase();
+				if (!tagEntriesByTag.has(normalizedTag)) tagEntriesByTag.set(normalizedTag, []);
+				const entries = tagEntriesByTag.get(normalizedTag);
+				const current = {
+					sched,
+					tag,
+					startIdx,
+					slotCount: sched.slot_count,
+					gapSlots: getEventTagGapSlotCount()
+				};
+				for (const other of entries) {
+					if (!tagEntriesTooClose(current, other)) continue;
+					const pairKey = [sched.id, other.sched.id].sort().join('|') + `|${normalizedTag}`;
+					if (reportedTagConflicts.has(pairKey)) continue;
+					reportedTagConflicts.add(pairKey);
+					pushIssue(result, {
+						severity: SEVERITY.ERROR,
+						message: `Tag „${tag}” wymaga godziny przerwy od „${other.sched.event.title}"`,
+						scheduleId: sched.id
+					});
+					pushIssue(result, {
+						severity: SEVERITY.ERROR,
+						message: `Tag „${tag}” wymaga godziny przerwy od „${sched.event.title}"`,
+						scheduleId: other.sched.id
+					});
+				}
+				entries.push(current);
 			}
 		}
 
@@ -2134,15 +2323,6 @@
 		}
 	}
 
-	function handleUnscheduledClick(event, unscheduledEvent, anchorEl) {
-		if (blockNextClick || dragState?.moved) {
-			blockNextClick = false;
-			return;
-		}
-		event.stopPropagation();
-		openUnscheduledPanel(unscheduledEvent, anchorEl);
-	}
-
 	function handleEventClick(event, schedule, anchorEl) {
 		if (blockNextClick || dragState?.moved) {
 			blockNextClick = false;
@@ -2322,6 +2502,20 @@
 		const day = daySections[commitTarget.dayIdx ?? targetDayIdx];
 		const daySchedules = hintIndexes.daySchedules.get(day.date) ?? [];
 
+		const samePlace =
+			!item.isUnscheduled &&
+			schedule.room_id === commitTarget.roomId &&
+			schedule.start_time_slot_id === commitTarget.startTimeSlotId;
+		if (samePlace) return;
+
+		const dropAppearance = getDropPreviewAppearance(item, commitTarget);
+		if (dropAppearance.kind === 'error') {
+			toast.error(item.isUnscheduled ? 'Nie można zaplanować' : 'Nie można przenieść', {
+				description: dropAppearance.messages?.[0] ?? 'To miejsce łamie wymagania grafiku'
+			});
+			return;
+		}
+
 		if (item.isUnscheduled) {
 			const existing = findOccupyingSchedules(
 				commitTarget.roomId,
@@ -2341,19 +2535,6 @@
 				room_id: commitTarget.roomId,
 				start_time_slot_id: commitTarget.startTimeSlotId,
 				slot_count: schedule.slot_count
-			});
-			return;
-		}
-
-		const samePlace =
-			schedule.room_id === commitTarget.roomId &&
-			schedule.start_time_slot_id === commitTarget.startTimeSlotId;
-		if (samePlace) return;
-
-		const dropAppearance = getDropPreviewAppearance(item, commitTarget);
-		if (dropAppearance.kind === 'error') {
-			toast.error('Nie można przenieść', {
-				description: dropAppearance.messages?.[0] ?? 'To miejsce łamie wymagania grafiku'
 			});
 			return;
 		}
@@ -2748,9 +2929,12 @@
 											{@const showDragEdge = Boolean(swapHint && activeDropEdgeIds.has(item.id))}
 											<div
 												class="sheet-event"
+												class:sheet-event--compact={isCompactTile(item.schedule.slot_count)}
 												class:sheet-event--error={appearance.kind === 'error'}
 												class:sheet-event--warning={appearance.kind === 'warning'}
 												class:sheet-event--info={appearance.kind === 'info'}
+												class:sheet-event--search-hidden={eventSearchActive &&
+													!matchingScheduleIds?.has(item.id)}
 												class:sheet-event--selected={selectedSchedule?.id === item.id}
 												class:sheet-event--locked={item.schedule.locked}
 												class:sheet-event--chain-source={chainSwap.sourceScheduleId === item.id}
@@ -2823,6 +3007,13 @@
 													{/if}
 												</div>
 												<div class="sheet-event-title">{item.schedule.event.title}</div>
+												{#if getEventTags(item.schedule.event).length}
+													<div class="sheet-event-tags">
+														{#each getEventTags(item.schedule.event) as tag (tag)}
+															<span class="sheet-event-tag">{tag}</span>
+														{/each}
+													</div>
+												{/if}
 											</div>
 										{/each}
 									</div>
@@ -2834,8 +3025,9 @@
 			</div>
 
 			<aside class="sheet-sidebar">
+				<div class="sheet-sidebar-sticky">
 				<div class="sheet-sidebar-header">
-					<span>Niezaplanowane</span>
+					<span>{eventSearchActive ? 'Wyniki wyszukiwania' : 'Atrakcje'}</span>
 					<div class="sheet-sidebar-header-actions">
 						<button
 							type="button"
@@ -2851,31 +3043,150 @@
 								<span>T↓</span>
 							{/if}
 						</button>
-						<span class="sheet-sidebar-count">{unscheduled.length}</span>
+						<span class="sheet-sidebar-count">{displayedSidebarItems.length}</span>
 					</div>
 				</div>
+
+				<div class="sheet-sidebar-controls">
+					<div class="sheet-sidebar-search">
+						<span class="sheet-sidebar-search-icon" aria-hidden="true">
+							<Search size={14} />
+						</span>
+						<Input
+							class="sheet-sidebar-search-input"
+							type="search"
+							placeholder={searchPlaceholder}
+							bind:value={eventSearchQuery}
+							list="schedule-event-tag-options"
+							aria-label="Szukaj atrakcji w całym planie"
+						/>
+						<datalist id="schedule-event-tag-options">
+							{#each allEventTags as tag (tag)}
+								<option value="tag:{tag}">{tag}</option>
+							{/each}
+						</datalist>
+						{#if eventSearchActive}
+							<button
+								type="button"
+								class="sheet-sidebar-search-clear"
+								title="Wyczyść wyszukiwanie"
+								aria-label="Wyczyść wyszukiwanie"
+								onclick={clearEventSearch}
+							>
+								<X size={14} />
+							</button>
+						{/if}
+					</div>
+
+					{#if !eventSearchActive}
+						<p class="sheet-sidebar-search-hint">
+							Wpisz <strong>tag:</strong>, żeby wybrać tag z podpowiedzi i podświetlić jego atrakcje.
+						</p>
+						<div class="sheet-sidebar-filters" role="tablist" aria-label="Filtr atrakcji">
+							<button
+								type="button"
+								class="sheet-sidebar-filter"
+								class:sheet-sidebar-filter--active={sidebarFilter === 'unscheduled'}
+								role="tab"
+								aria-selected={sidebarFilter === 'unscheduled'}
+								onclick={() => (sidebarFilter = 'unscheduled')}
+							>
+								Oczekujące
+							</button>
+							<button
+								type="button"
+								class="sheet-sidebar-filter"
+								class:sheet-sidebar-filter--active={sidebarFilter === 'scheduled'}
+								role="tab"
+								aria-selected={sidebarFilter === 'scheduled'}
+								onclick={() => (sidebarFilter = 'scheduled')}
+							>
+								W grafiku
+							</button>
+							<button
+								type="button"
+								class="sheet-sidebar-filter"
+								class:sheet-sidebar-filter--active={sidebarFilter === 'all'}
+								role="tab"
+								aria-selected={sidebarFilter === 'all'}
+								onclick={() => (sidebarFilter = 'all')}
+							>
+								Wszystkie
+							</button>
+						</div>
+					{:else}
+						<p class="sheet-sidebar-search-hint">
+							{#if tagSearchActive}
+								{#if tagSearchValue}
+									Podświetlam atrakcje z tagiem <strong>#{tagSearchValue}</strong>.
+								{:else}
+									Wybierz tag z listy podpowiedzi po <strong>tag:</strong>.
+								{/if}
+							{:else}
+								Wyszukiwanie obejmuje cały plan — na siatce widać tylko pasujące atrakcje.
+							{/if}
+						</p>
+					{/if}
+				</div>
+				</div>
+
 				<div class="sheet-sidebar-list">
-					{#each displayedUnscheduled as event}
-						{@const dragItem = makeUnscheduledDragItem(event)}
+					{#each displayedSidebarItems as item (item.key)}
+						{@const dragItem =
+							item.kind === 'unscheduled' ? makeUnscheduledDragItem(item.event) : null}
 						<div
 							class="sheet-sidebar-item"
-							class:sheet-sidebar-item--dragging={dragState?.item?.id === dragItem.id && dragState?.moved}
-							onpointerdown={(e) => startUnscheduledDrag(e, dragItem)}
-							onclick={(e) => handleUnscheduledClick(e, event, e.currentTarget)}
+							class:sheet-sidebar-item--scheduled={item.kind === 'scheduled'}
+							class:sheet-sidebar-item--dragging={dragItem &&
+								dragState?.item?.id === dragItem.id &&
+								dragState?.moved}
+							class:sheet-sidebar-item--selected={item.kind === 'scheduled'
+								? selectedSchedule?.id === item.schedule.id
+								: selectedUnscheduledEvent?.id === item.event.id}
+							onpointerdown={(e) => dragItem && startUnscheduledDrag(e, dragItem)}
+							onclick={(e) => handleSidebarItemClick(e, item, e.currentTarget)}
 							role="button"
 							tabindex="0"
 						>
-							<span class="sheet-sidebar-item-title">{event.title}</span>
+							<div class="sheet-sidebar-item-head">
+								<span class="sheet-sidebar-item-title">{item.event.title}</span>
+								<span
+									class="sheet-sidebar-item-badge"
+									class:sheet-sidebar-item-badge--scheduled={item.kind === 'scheduled'}
+								>
+									{item.kind === 'scheduled' ? 'Grafik' : 'Oczekuje'}
+								</span>
+							</div>
 							<span class="sheet-sidebar-item-meta">
-								{hostLabel(event)} · {event.duration_minutes} min · T{event.tier ?? 2}
-								{#if event.auto_schedule === 0}
+								{hostLabel(item.event)} · {item.event.duration_minutes} min · T{item.event.tier ?? 2}
+								{#if item.event.auto_schedule === 0}
 									· ręcznie
 								{/if}
+								{#if item.kind === 'scheduled'}
+									· {item.schedule.room?.name || 'Sala'} · {formatTime(item.schedule.start_slot?.start_time)}
+								{/if}
 							</span>
+							{#if getEventTags(item.event).length}
+								<span class="sheet-sidebar-item-tags">
+									{#each getEventTags(item.event) as tag (tag)}
+										<span class="sheet-sidebar-item-tag">{tag}</span>
+									{/each}
+								</span>
+							{/if}
 						</div>
 					{/each}
-					{#if unscheduled.length === 0}
-						<div class="sheet-sidebar-empty">Wszystko zaplanowane</div>
+					{#if displayedSidebarItems.length === 0}
+						<div class="sheet-sidebar-empty">
+							{#if eventSearchActive}
+								Brak wyników dla „{eventSearchQuery.trim()}”.
+							{:else if sidebarFilter === 'scheduled'}
+								Brak zaplanowanych atrakcji.
+							{:else if sidebarFilter === 'all'}
+								Brak atrakcji.
+							{:else}
+								Wszystko zaplanowane
+							{/if}
+						</div>
 					{/if}
 				</div>
 			</aside>
@@ -3874,6 +4185,12 @@
 		box-sizing: border-box;
 		touch-action: none;
 		user-select: none;
+		min-height: 0;
+	}
+
+	.sheet-event--compact {
+		padding: 0.125rem 0.3125rem 0.1875rem;
+		gap: 0.0625rem;
 	}
 
 	.sheet-event--error {
@@ -4125,12 +4442,20 @@
 		display: flex;
 		align-items: center;
 		gap: 0.375rem;
+		flex: 0 0 auto;
 		flex-shrink: 0;
 		min-height: 1.25rem;
 		margin: -0.25rem -0.375rem 0;
 		padding: 0.125rem 0.375rem;
 		border-bottom: 1px solid rgba(0, 0, 0, 0.12);
 		background: rgba(255, 255, 255, 0.62);
+	}
+
+	.sheet-event--compact .sheet-event-meta {
+		min-height: 1.125rem;
+		margin: -0.125rem -0.25rem 0;
+		padding: 0.0625rem 0.25rem;
+		gap: 0.25rem;
 	}
 
 	.sheet-event-time {
@@ -4141,6 +4466,12 @@
 		font-variant-numeric: tabular-nums;
 		flex-shrink: 0;
 		letter-spacing: 0.01em;
+	}
+
+	.sheet-event--compact .sheet-event-time,
+	.sheet-event--compact .sheet-event-host {
+		font-size: 10px;
+		line-height: 1.15;
 	}
 
 	.sheet-event-host {
@@ -4217,11 +4548,11 @@
 		font-size: 12px;
 		font-weight: 500;
 		color: #202124;
-		line-height: 1.35;
+		line-height: 1.25;
 		word-break: break-word;
 		overflow-wrap: break-word;
 		flex: 1 1 auto;
-		min-height: 0;
+		min-height: calc(var(--title-lines, 1) * 1.25em);
 		overflow: hidden;
 		display: -webkit-box;
 		-webkit-box-orient: vertical;
@@ -4229,13 +4560,71 @@
 		line-clamp: var(--title-lines, 2);
 	}
 
+	.sheet-event--compact .sheet-event-title {
+		font-size: 11px;
+		line-height: 1.2;
+	}
+
+	.sheet-event-tags {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.125rem;
+		flex: 0 0 auto;
+		max-height: 1.1rem;
+		overflow: hidden;
+	}
+
+	.sheet-event-tag {
+		font-size: 10px;
+		font-style: italic;
+		font-weight: 700;
+		line-height: 1;
+		color: var(--ev-text);
+		white-space: nowrap;
+	}
+
+	.sheet-event-tag::before {
+		content: '#';
+	}
+
+	.sheet-event--compact .sheet-event-tags {
+		max-height: 0.9rem;
+	}
+
+	.sheet-event--compact .sheet-event-tag {
+		font-size: 9px;
+	}
+
+	/* Search mode keeps matches unchanged and dims everything else. */
+	.sheet-event--search-hidden {
+		opacity: 0.28;
+		filter: grayscale(0.5);
+		pointer-events: none;
+	}
+
+	.sheet-event--search-hidden:hover {
+		box-shadow: none;
+		z-index: 1;
+	}
+
 	.sheet-sidebar {
-		width: 260px;
+		width: 300px;
 		flex-shrink: 0;
 		display: flex;
 		flex-direction: column;
+		min-height: 0;
+		overflow: hidden;
 		border-left: 1px solid #dadce0;
 		background: #fff;
+	}
+
+	.sheet-sidebar-sticky {
+		position: sticky;
+		top: 0;
+		z-index: 30;
+		flex: 0 0 auto;
+		background: #fff;
+		box-shadow: 0 1px 0 #dadce0;
 	}
 
 	.sheet-sidebar-header {
@@ -4289,8 +4678,95 @@
 		font-size: 11px;
 	}
 
+	.sheet-sidebar-controls {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.5rem 0.75rem 0.625rem;
+		border-bottom: 1px solid #dadce0;
+		background: #fff;
+	}
+
+	.sheet-sidebar-search {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.sheet-sidebar-search-icon {
+		position: absolute;
+		left: 0.5rem;
+		display: inline-flex;
+		align-items: center;
+		color: #5f6368;
+		pointer-events: none;
+	}
+
+	:global(.sheet-sidebar-search-input) {
+		height: 2rem;
+		padding-left: 1.75rem;
+		padding-right: 1.75rem;
+		font-size: 12px;
+	}
+
+	.sheet-sidebar-search-clear {
+		position: absolute;
+		right: 0.25rem;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 1.5rem;
+		height: 1.5rem;
+		border: none;
+		border-radius: 999px;
+		background: transparent;
+		color: #5f6368;
+		cursor: pointer;
+	}
+
+	.sheet-sidebar-search-clear:hover {
+		background: #f1f3f4;
+		color: #202124;
+	}
+
+	.sheet-sidebar-filters {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 0.25rem;
+	}
+
+	.sheet-sidebar-filter {
+		padding: 0.3125rem 0.375rem;
+		border: 1px solid #dadce0;
+		border-radius: 4px;
+		background: #fff;
+		font-size: 10px;
+		color: #5f6368;
+		cursor: pointer;
+		line-height: 1.2;
+	}
+
+	.sheet-sidebar-filter:hover {
+		background: #f8f9fa;
+		color: #202124;
+	}
+
+	.sheet-sidebar-filter--active {
+		border-color: #1a73e8;
+		background: #e8f0fe;
+		color: #1a73e8;
+	}
+
+	.sheet-sidebar-search-hint {
+		margin: 0;
+		font-size: 10px;
+		line-height: 1.35;
+		color: #5f6368;
+	}
+
 	.sheet-sidebar-list {
 		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 		padding: 0.5rem;
 		display: flex;
@@ -4311,6 +4787,42 @@
 		transition: background 0.1s, border-color 0.1s;
 		user-select: none;
 		touch-action: none;
+	}
+
+	.sheet-sidebar-item--scheduled {
+		cursor: pointer;
+		border-color: #c6dafc;
+		background: #f8fbff;
+	}
+
+	.sheet-sidebar-item--selected {
+		border-color: #1a73e8;
+		box-shadow: inset 0 0 0 1px rgba(26, 115, 232, 0.18);
+	}
+
+	.sheet-sidebar-item-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 0.375rem;
+	}
+
+	.sheet-sidebar-item-badge {
+		flex-shrink: 0;
+		padding: 0.0625rem 0.3125rem;
+		border-radius: 999px;
+		background: #fef7e0;
+		color: #b06000;
+		font-size: 9px;
+		font-weight: 600;
+		line-height: 1.3;
+		text-transform: uppercase;
+		letter-spacing: 0.02em;
+	}
+
+	.sheet-sidebar-item-badge--scheduled {
+		background: #e8f0fe;
+		color: #1967d2;
 	}
 
 	.sheet-sidebar-item--dragging {
@@ -4341,6 +4853,25 @@
 	.sheet-sidebar-item-meta {
 		font-size: 11px;
 		color: #5f6368;
+	}
+
+	.sheet-sidebar-item-tags {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+		margin-top: 0.125rem;
+	}
+
+	.sheet-sidebar-item-tag {
+		font-size: 10px;
+		font-style: italic;
+		font-weight: 700;
+		line-height: 1;
+		color: #1967d2;
+	}
+
+	.sheet-sidebar-item-tag::before {
+		content: '#';
 	}
 
 	.sheet-sidebar-empty {

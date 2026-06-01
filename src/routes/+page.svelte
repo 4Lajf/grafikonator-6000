@@ -3,12 +3,27 @@
 	import Button from '$lib/components/ui/button/button.svelte';
 	import { buttonVariants } from '$lib/components/ui/button/index.js';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
+	import FileInput from '$lib/components/ui/file-input/file-input.svelte';
 	import { onMount } from 'svelte';
-	import { getConventions } from '$lib/database.js';
+	import {
+		buildPlanFilename,
+		describePlan,
+		exportPlan,
+		getConventions,
+		importPlan,
+		parsePlanJson
+	} from '$lib/database.js';
 	import { clearAllData } from '$lib/local-db.js';
+	import { toast } from 'svelte-sonner';
 
 	let active = $state(null);
 	let showClearDialog = $state(false);
+	let showImportDialog = $state(false);
+	let pendingImportJson = $state('');
+	let pendingImportSummary = $state(null);
+	let importFileName = $state('');
+	let exporting = $state(false);
+	let importing = $state(false);
 
 	onMount(async () => {
 		try {
@@ -18,6 +33,75 @@
 			active = null;
 		}
 	});
+
+	async function handleExportPlan() {
+		if (!active) {
+			toast.error('Brak planu do eksportu', {
+				description: 'Najpierw zaimportuj dane konwentu albo utwórz plan ręcznie.'
+			});
+			return;
+		}
+
+		exporting = true;
+		try {
+			const json = await exportPlan();
+			const blob = new Blob([json], { type: 'application/json' });
+			const url = URL.createObjectURL(blob);
+			const link = document.createElement('a');
+			link.href = url;
+			link.download = buildPlanFilename(active.name);
+			link.click();
+			URL.revokeObjectURL(url);
+			toast.success('Wyeksportowano plan', {
+				description: 'Plik JSON możesz przenieść na inny komputer albo wysłać współorganizatorowi.'
+			});
+		} catch (error) {
+			toast.error('Błąd eksportu', { description: error.message });
+		} finally {
+			exporting = false;
+		}
+	}
+
+	async function handleImportFileChange(event) {
+		const file = event.currentTarget.files?.[0];
+		importFileName = file?.name || '';
+		if (!file) return;
+
+		try {
+			const text = await file.text();
+			const data = parsePlanJson(text);
+			pendingImportJson = text;
+			pendingImportSummary = describePlan(data);
+			showImportDialog = true;
+		} catch (error) {
+			pendingImportJson = '';
+			pendingImportSummary = null;
+			toast.error('Nie można wczytać pliku', { description: error.message });
+		} finally {
+			event.currentTarget.value = '';
+		}
+	}
+
+	async function confirmImportPlan() {
+		if (!pendingImportJson) return;
+
+		importing = true;
+		try {
+			const result = await importPlan(pendingImportJson);
+			active = result.active;
+			showImportDialog = false;
+			pendingImportJson = '';
+			pendingImportSummary = null;
+			importFileName = '';
+			toast.success('Zaimportowano plan', {
+				description: result.summary.conventionName
+			});
+		} catch (error) {
+			toast.error('Błąd importu', { description: error.message });
+		} finally {
+			importing = false;
+		}
+	}
 
 	function confirmClearData() {
 		clearAllData();
@@ -79,6 +163,29 @@
 		</ol>
 	</section>
 
+	<section class="g-section-card">
+		<h2 class="g-section-title">Eksport i import planu</h2>
+		<p class="mb-4 text-sm text-muted-foreground">
+			Zapisz cały plan konwentu w pliku JSON, żeby kontynuować pracę na innym komputerze albo
+			udostępnić go współorganizatorowi. Plik zawiera osoby, atrakcje, sale, dyspozycyjność i
+			grafik.
+		</p>
+		<div class="flex flex-col gap-4 sm:flex-row sm:items-end">
+			<Button onclick={handleExportPlan} disabled={!active || exporting}>
+				{exporting ? 'Eksportowanie…' : 'Eksportuj plan (JSON)'}
+			</Button>
+			<div class="min-w-0 flex-1 sm:max-w-md">
+				<FileInput
+					id="plan-import"
+					label="Importuj plan (JSON)"
+					accept=".json,application/json"
+					fileName={importFileName}
+					onchange={handleImportFileChange}
+				/>
+			</div>
+		</div>
+	</section>
+
 	<section class="g-danger-zone">
 		<h2 class="g-section-title text-[#c5221f]">Wyczyść dane</h2>
 		<p class="mb-4 text-sm text-muted-foreground">
@@ -87,6 +194,45 @@
 		<Button variant="outline" onclick={() => (showClearDialog = true)}>Wyczyść dane</Button>
 	</section>
 </div>
+
+<AlertDialog.Root bind:open={showImportDialog}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>Zastąpić bieżący plan?</AlertDialog.Title>
+			<AlertDialog.Description>
+				{#if pendingImportSummary}
+					Plik zawiera konwent <strong>{pendingImportSummary.conventionName}</strong>
+					({pendingImportSummary.peopleCount} osób, {pendingImportSummary.eventCount} atrakcji,
+					{pendingImportSummary.scheduleCount} wpisów w grafiku).
+				{/if}
+				{#if active}
+					Bieżący plan (<strong>{active.name}</strong>) zostanie usunięty z tej przeglądarki i
+					zastąpiony importowanym.
+				{:else}
+					Plan zostanie zapisany lokalnie w tej przeglądarce.
+				{/if}
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel
+				onclick={() => {
+					pendingImportJson = '';
+					pendingImportSummary = null;
+					importFileName = '';
+				}}
+			>
+				Anuluj
+			</AlertDialog.Cancel>
+			<AlertDialog.Action
+				class={buttonVariants({ variant: 'destructive' })}
+				onclick={confirmImportPlan}
+				disabled={importing}
+			>
+				{importing ? 'Importowanie…' : 'Importuj plan'}
+			</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
 
 <AlertDialog.Root bind:open={showClearDialog}>
 	<AlertDialog.Content>

@@ -19,7 +19,9 @@
 	}
 </script>
 
-<div class="flex min-h-screen flex-col bg-background">
+<div
+	class="flex flex-col bg-background {isSchedule ? 'h-screen overflow-hidden' : 'min-h-screen'}"
+>
 	<header class="g-app-bar">
 		<div class="g-app-bar-inner" class:g-app-bar-inner--wide={!isSchedule}>
 			<a href="/" class="g-brand">

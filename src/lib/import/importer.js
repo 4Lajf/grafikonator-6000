@@ -194,7 +194,8 @@ export function previewImport(options) {
 			needs_laptop: /potrzebuj/i.test(mapped.needs_laptop || ''),
 			needs_speakers: /potrzebuj/i.test(mapped.needs_speakers || ''),
 			estimated_attendance: parseInteger(mapped.estimated_attendance),
-			required_room_tags: parseList(mapped.required_room_tags),
+			required_room_tags: [],
+			event_tags: [...parseList(mapped.event_tags), ...parseList(mapped.required_room_tags)],
 			equipment_needs: parseList(mapped.equipment_needs),
 			availability: expanded,
 			source_row_hash: rowHash(row)

@@ -120,10 +120,11 @@ const FIELD_RULES = [
 		]
 	},
 	{
-		field: 'required_room_tags',
+		field: 'event_tags',
 		priority: 10,
 		patterns: [
-			/wymagane tagi sali|wymagane.*sali|required room tags|required tags/i
+			/wymagane tagi sali|wymagane.*sali|required room tags|required tags/i,
+			/tagi atrakcji|tagi tematyczne|tematyka|tematy|target|audience|event tags|topic tags/i
 		]
 	},
 	{
@@ -209,7 +210,7 @@ export const APP_FIELDS = [
 	{ key: 'availability', label: 'Dyspozycyjność' },
 	{ key: 'event_tier', label: 'Priorytet atrakcji (tier)' },
 	{ key: 'estimated_attendance', label: 'Szacowana frekwencja' },
-	{ key: 'required_room_tags', label: 'Wymagane tagi sali' },
+	{ key: 'event_tags', label: 'Tagi atrakcji / sali' },
 	{ key: 'kind', label: 'Typ atrakcji' },
 	{ key: 'auto_schedule', label: 'Auto-planowanie' },
 	{ key: '_skip', label: '(pomiń kolumnę)' }

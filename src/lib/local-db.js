@@ -1,3 +1,6 @@
+import { normalizeEndHour, normalizeHourWindow, normalizeStartHour } from './convention-hours.js';
+import { describePlan, parsePlanJson, serializePlan } from './plan-io.js';
+
 const STORAGE_KEY = 'grafikonator-6000-data';
 
 /** @typedef {import('./import/importer.js').PreviewResult} PreviewResult */
@@ -122,6 +125,42 @@ function normalizeList(value) {
 		.filter(Boolean);
 }
 
+function mergeTagLists(...values) {
+	const seen = new Set();
+	const merged = [];
+	for (const value of values) {
+		for (const tag of normalizeList(value)) {
+			const key = tag.toLowerCase();
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(tag);
+		}
+	}
+	return merged;
+}
+
+function getUnifiedEventTags(event) {
+	return mergeTagLists(event?.event_tags, event?.required_room_tags);
+}
+
+function normalizeEventTags(value) {
+	return [...new Set(normalizeList(value).map((tag) => tag.toLowerCase()))];
+}
+
+function getEventTagGapSlotCount(conventionId) {
+	const convention = getConvention(conventionId);
+	const slotMinutes = Number(convention?.slot_minutes) || 60;
+	return Math.max(1, Math.ceil(60 / slotMinutes));
+}
+
+function tagEntriesTooClose(a, b) {
+	if (!a || !b || a.date !== b.date) return false;
+	const requiredGap = Math.max(a.gapSlots ?? 1, b.gapSlots ?? 1);
+	const aEnd = a.startIdx + a.slotCount;
+	const bEnd = b.startIdx + b.slotCount;
+	return a.startIdx < bEnd + requiredGap && b.startIdx < aEnd + requiredGap;
+}
+
 function normalizeNullableInteger(value) {
 	if (value == null || value === '') return null;
 	const parsed = Number(value);
@@ -167,30 +206,6 @@ function roomRecord(conventionId, name, timestamp, capabilities = roomCapabiliti
 function normalizeTier(value, fallback = 2) {
 	const n = Number(value);
 	return n === 1 || n === 2 || n === 3 ? n : fallback;
-}
-
-function normalizeStartHour(value, fallback = 8) {
-	const n = Number(value);
-	if (!Number.isFinite(n)) return fallback;
-	return Math.min(23, Math.max(0, Math.floor(n)));
-}
-
-function normalizeEndHour(value, fallback = 22) {
-	const n = Number(value);
-	if (!Number.isFinite(n)) return fallback;
-	return Math.min(24, Math.max(1, Math.floor(n)));
-}
-
-function normalizeHourWindow(startHour, endHour, fallbackStart = 8, fallbackEnd = 22) {
-	let start = normalizeStartHour(startHour, fallbackStart);
-	let end = normalizeEndHour(endHour, fallbackEnd);
-	if (end <= start) {
-		end = Math.min(24, start + 1);
-	}
-	if (end <= start) {
-		start = Math.max(0, end - 1);
-	}
-	return { startHour: start, endHour: end };
 }
 
 function buildDateRange(startDate, endDate) {
@@ -340,6 +355,19 @@ function migrateLoadedState() {
 			event.required_room_tags = [];
 			changed = true;
 		}
+		if (event.event_tags === undefined) {
+			event.event_tags = [];
+			changed = true;
+		}
+		const unifiedTags = getUnifiedEventTags(event);
+		if (JSON.stringify(event.event_tags ?? []) !== JSON.stringify(unifiedTags)) {
+			event.event_tags = unifiedTags;
+			changed = true;
+		}
+		if ((event.required_room_tags ?? []).length > 0) {
+			event.required_room_tags = [];
+			changed = true;
+		}
 		if (event.equipment_needs === undefined) {
 			event.equipment_needs = [];
 			changed = true;
@@ -358,28 +386,8 @@ function migrateLoadedState() {
 		}
 	}
 
-	for (const convention of state.conventions) {
-		const slots = state.time_slots.filter((ts) => ts.convention_id === convention.id);
-		const people = state.people.filter((p) => p.convention_id === convention.id);
-		const timestamp = now();
-		for (const person of people) {
-			for (const slot of slots) {
-				const existing = state.availability.find(
-					(a) => a.person_id === person.id && a.time_slot_id === slot.id
-				);
-				if (!existing) {
-					state.availability.push({
-						id: crypto.randomUUID(),
-						person_id: person.id,
-						time_slot_id: slot.id,
-						tier: 1,
-						created_at: timestamp,
-						updated_at: timestamp
-					});
-					changed = true;
-				}
-			}
-		}
+	if (compactAvailability()) {
+		changed = true;
 	}
 
 	for (const room of state.rooms) {
@@ -424,8 +432,15 @@ function ensureLoaded() {
 	loaded = true;
 }
 
+function compactAvailability() {
+	const before = state.availability.length;
+	state.availability = state.availability.filter((row) => normalizeTier(row.tier, 1) !== 1);
+	return state.availability.length !== before;
+}
+
 function persist() {
 	if (typeof localStorage === 'undefined') return;
+	compactAvailability();
 	localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
@@ -632,9 +647,13 @@ export function updatePerson(id, updates) {
 
 export function deletePerson(id) {
 	ensureLoaded();
-	const hostedEvents = state.event_hosts.filter((eh) => eh.person_id === id);
-	if (hostedEvents.length > 0) {
-		throw new Error('Nie można usunąć osoby z atrakcjami. Najpierw usuń jej atrakcje.');
+	const eventIds = [
+		...new Set(
+			state.event_hosts.filter((eh) => eh.person_id === id).map((eh) => eh.event_id)
+		)
+	];
+	for (const eventId of eventIds) {
+		deleteEvent(eventId);
 	}
 	state.availability = state.availability.filter((a) => a.person_id !== id);
 	state.people = state.people.filter((p) => p.id !== id);
@@ -794,7 +813,8 @@ export function createEvent(conventionId, personId, data) {
 		needs_laptop: data.needs_laptop ? 1 : 0,
 		needs_speakers: data.needs_speakers ? 1 : 0,
 		estimated_attendance: normalizeNullableInteger(data.estimated_attendance),
-		required_room_tags: normalizeList(data.required_room_tags),
+		required_room_tags: [],
+		event_tags: mergeTagLists(data.event_tags, data.required_room_tags),
 		equipment_needs: normalizeList(data.equipment_needs),
 		source_row_hash: null,
 		created_at: timestamp,
@@ -826,8 +846,12 @@ export function updateEvent(id, updates) {
 	if (updates.estimated_attendance !== undefined) {
 		event.estimated_attendance = normalizeNullableInteger(updates.estimated_attendance);
 	}
-	if (updates.required_room_tags !== undefined) {
-		event.required_room_tags = normalizeList(updates.required_room_tags);
+	if (updates.required_room_tags !== undefined || updates.event_tags !== undefined) {
+		event.event_tags = mergeTagLists(
+			updates.event_tags !== undefined ? updates.event_tags : event.event_tags,
+			updates.required_room_tags
+		);
+		event.required_room_tags = [];
 	}
 	if (updates.equipment_needs !== undefined) {
 		event.equipment_needs = normalizeList(updates.equipment_needs);
@@ -878,6 +902,12 @@ export function setPersonAvailabilityBulk(personId, slotTiers) {
 		const existing = state.availability.find(
 			(a) => a.person_id === personId && a.time_slot_id === slotId
 		);
+		if (normalizedTier === 1) {
+			if (existing) {
+				state.availability = state.availability.filter((a) => a !== existing);
+			}
+			continue;
+		}
 		if (existing) {
 			existing.tier = normalizedTier;
 			existing.updated_at = timestamp;
@@ -1166,21 +1196,11 @@ export function getEffectiveAvailability(personId, timeSlotId) {
 }
 
 function ensureDefaultAvailabilityForPerson(personId, conventionId, timestamp, defaultTier = 1) {
+	const normalizedDefaultTier = normalizeTier(defaultTier, 1);
+	if (normalizedDefaultTier === 1) return;
 	const slots = state.time_slots.filter((ts) => ts.convention_id === conventionId);
 	for (const slot of slots) {
-		const existing = state.availability.find(
-			(a) => a.person_id === personId && a.time_slot_id === slot.id
-		);
-		if (!existing) {
-			state.availability.push({
-				id: crypto.randomUUID(),
-				person_id: personId,
-				time_slot_id: slot.id,
-				tier: normalizeTier(defaultTier, 1),
-				created_at: timestamp,
-				updated_at: timestamp
-			});
-		}
+		upsertAvailability(personId, slot.id, normalizedDefaultTier, timestamp);
 	}
 }
 
@@ -1191,6 +1211,14 @@ export function setAvailability(personId, timeSlotId, tier) {
 	const existing = state.availability.find(
 		(a) => a.person_id === personId && a.time_slot_id === timeSlotId
 	);
+
+	if (normalizedTier === 1) {
+		if (existing) {
+			state.availability = state.availability.filter((a) => a !== existing);
+			persist();
+		}
+		return null;
+	}
 
 	if (existing) {
 		existing.tier = normalizedTier;
@@ -1217,6 +1245,12 @@ function upsertAvailability(personId, slotId, tier, timestamp) {
 	const existing = state.availability.find(
 		(a) => a.person_id === personId && a.time_slot_id === slotId
 	);
+	if (normalizedTier === 1) {
+		if (existing) {
+			state.availability = state.availability.filter((a) => a !== existing);
+		}
+		return null;
+	}
 	if (existing) {
 		existing.tier = Math.min(existing.tier, normalizedTier);
 		existing.updated_at = timestamp;
@@ -1266,7 +1300,8 @@ function mapScheduleRow(schedule) {
 			tier: normalizeTier(event?.tier, 2),
 			auto_schedule: event?.auto_schedule === 0 ? 0 : 1,
 			estimated_attendance: event?.estimated_attendance ?? null,
-			required_room_tags: normalizeList(event?.required_room_tags),
+			required_room_tags: [],
+			event_tags: getUnifiedEventTags(event),
 			equipment_needs: normalizeList(event?.equipment_needs),
 			host_name
 		},
@@ -1460,6 +1495,52 @@ function hostsConflict(hostIds, slotIds, excludeEventId = null) {
 	return false;
 }
 
+function findEventTagConflict(eventTags, block, excludeEventId = null, excludeScheduleId = null) {
+	const normalizedTags = normalizeEventTags(eventTags);
+	const date = block[0]?.date;
+	const conventionId = block[0]?.convention_id;
+	if (normalizedTags.length === 0 || !date || !conventionId) return null;
+
+	const daySlots = getDaySlots(conventionId, date);
+	const startIdx = daySlots.findIndex((slot) => slot.id === block[0].id);
+	if (startIdx < 0) return null;
+
+	const candidateEntry = {
+		date,
+		startIdx,
+		slotCount: block.length,
+		gapSlots: getEventTagGapSlotCount(conventionId)
+	};
+
+	for (const schedule of state.schedules) {
+		if (schedule.id === excludeScheduleId || schedule.event_id === excludeEventId) continue;
+		const event = state.events.find((e) => e.id === schedule.event_id);
+		if (!event) continue;
+
+		const sharedTags = normalizedTags.filter((tag) => normalizeEventTags(getUnifiedEventTags(event)).includes(tag));
+		if (sharedTags.length === 0) continue;
+
+		const otherBlock = getSlotBlock(event.convention_id, schedule.start_time_slot_id, schedule.slot_count);
+		if (otherBlock[0]?.date !== date) continue;
+
+		const otherStartIdx = daySlots.findIndex((slot) => slot.id === otherBlock[0]?.id);
+		if (otherStartIdx < 0) continue;
+
+		if (
+			tagEntriesTooClose(candidateEntry, {
+				date,
+				startIdx: otherStartIdx,
+				slotCount: otherBlock.length,
+				gapSlots: getEventTagGapSlotCount(event.convention_id)
+			})
+		) {
+			return { event, tags: sharedTags };
+		}
+	}
+
+	return null;
+}
+
 function getDaySlots(conventionId, date) {
 	return state.time_slots
 		.filter((ts) => ts.convention_id === conventionId && ts.date === date && ts.is_active === 1)
@@ -1560,11 +1641,26 @@ function getEventTierForScheduling(event) {
 	return normalizeTier(event?.tier, 2);
 }
 
+function getConventionRoomTagVocabulary(conventionId) {
+	const tags = new Set();
+	for (const room of state.rooms.filter((r) => r.convention_id === conventionId)) {
+		for (const tag of normalizeRoomCapabilities(room.capabilities).tags) {
+			tags.add(tag.toLowerCase());
+		}
+	}
+	return tags;
+}
+
+function getEventRoomRequiredTags(event) {
+	const roomTagVocabulary = getConventionRoomTagVocabulary(event?.convention_id);
+	return getUnifiedEventTags(event).filter((tag) => roomTagVocabulary.has(tag.toLowerCase()));
+}
+
 function eventRoomFit(event, room) {
 	const capabilities = normalizeRoomCapabilities(room?.capabilities);
-	const requiredTags = normalizeList(event?.required_room_tags);
-	const roomTags = new Set(capabilities.tags);
-	const missingRequiredTags = requiredTags.filter((tag) => !roomTags.has(tag));
+	const requiredTags = getEventRoomRequiredTags(event);
+	const roomTags = new Set(capabilities.tags.map((tag) => tag.toLowerCase()));
+	const missingRequiredTags = requiredTags.filter((tag) => !roomTags.has(tag.toLowerCase()));
 	const estimatedAttendance = normalizeNullableInteger(event?.estimated_attendance);
 	const capacity = normalizeNullableInteger(capabilities.capacity);
 	const overCapacity =
@@ -1635,6 +1731,7 @@ function getAutoItemForEvent(event) {
 		eventId: event.id,
 		event,
 		eventTier: getEventTierForScheduling(event),
+		eventTags: normalizeEventTags(getUnifiedEventTags(event)),
 		hostIds: getEventHostIds(event.id),
 		conventionId: event.convention_id,
 		slotCount: getEventSlotCount(event),
@@ -1651,6 +1748,7 @@ function getAutoItemForSchedule(schedule) {
 		eventId: schedule.event_id,
 		event,
 		eventTier: getEventTierForScheduling(event),
+		eventTags: normalizeEventTags(getUnifiedEventTags(event)),
 		hostIds: getEventHostIds(schedule.event_id),
 		conventionId: event.convention_id,
 		slotCount: schedule.slot_count,
@@ -1703,6 +1801,32 @@ function blocksOverlap(a, b) {
 	return a.some((slot) => bSlotIds.has(slot.id));
 }
 
+function placementBlocksTooCloseByTag(aItem, aBlock, bItem, bBlock) {
+	const sharedTags = aItem.eventTags.filter((tag) => bItem.eventTags.includes(tag));
+	if (sharedTags.length === 0 || aBlock[0]?.date !== bBlock[0]?.date) return false;
+
+	const conventionId = aBlock[0]?.convention_id;
+	const daySlots = getDaySlots(conventionId, aBlock[0].date);
+	const aStartIdx = daySlots.findIndex((slot) => slot.id === aBlock[0]?.id);
+	const bStartIdx = daySlots.findIndex((slot) => slot.id === bBlock[0]?.id);
+	if (aStartIdx < 0 || bStartIdx < 0) return false;
+
+	return tagEntriesTooClose(
+		{
+			date: aBlock[0].date,
+			startIdx: aStartIdx,
+			slotCount: aBlock.length,
+			gapSlots: getEventTagGapSlotCount(conventionId)
+		},
+		{
+			date: bBlock[0].date,
+			startIdx: bStartIdx,
+			slotCount: bBlock.length,
+			gapSlots: getEventTagGapSlotCount(conventionId)
+		}
+	);
+}
+
 function findPlacementConflicts(item, placement, placements, registry) {
 	const block = getPlacementBlock(item, placement);
 	if (block.length < item.slotCount) return null;
@@ -1718,9 +1842,16 @@ function findPlacementConflicts(item, placement, placements, registry) {
 		if (!otherPlacement) continue;
 
 		const otherBlock = getPlacementBlock(other, otherPlacement);
-		if (!blocksOverlap(block, otherBlock)) continue;
+		const overlaps = blocksOverlap(block, otherBlock);
+		const tagTooClose = placementBlocksTooCloseByTag(item, block, other, otherBlock);
+		if (!overlaps && !tagTooClose) continue;
 
-		if (otherPlacement.room_id === placement.room_id || shareHost(item, other)) {
+		if (overlaps && (otherPlacement.room_id === placement.room_id || shareHost(item, other))) {
+			conflicts.set(other.key, other);
+			continue;
+		}
+
+		if (tagTooClose) {
 			conflicts.set(other.key, other);
 		}
 	}
@@ -2072,9 +2203,37 @@ function getSolverFixedSchedules(conventionId, autoEventIds) {
 	});
 }
 
+function addSolverTagDateEntries(occupancy, entries) {
+	for (const entry of entries || []) {
+		const key = `${entry.tag}|${entry.date}`;
+		if (!occupancy.tagDates.has(key)) occupancy.tagDates.set(key, []);
+		occupancy.tagDates.get(key).push(entry);
+	}
+}
+
+function removeSolverTagDateEntries(occupancy, entries) {
+	for (const entry of entries || []) {
+		const key = `${entry.tag}|${entry.date}`;
+		const current = occupancy.tagDates.get(key) || [];
+		const idx = current.lastIndexOf(entry);
+		if (idx >= 0) current.splice(idx, 1);
+		if (current.length === 0) occupancy.tagDates.delete(key);
+	}
+}
+
+function solverTagSpacingConflicts(occupancy, placement) {
+	for (const entry of placement.tagDateEntries || []) {
+		const current = occupancy.tagDates.get(`${entry.tag}|${entry.date}`) || [];
+		if (current.some((other) => tagEntriesTooClose(entry, other))) return true;
+	}
+	return false;
+}
+
 function addSolverOccupancyForPlacement(occupancy, placement) {
 	for (const key of placement.roomKeys) occupancy.room.add(key);
+	for (const key of placement.tagKeys || []) occupancy.tag.add(key);
 	for (const key of placement.hostKeys) occupancy.host.add(key);
+	addSolverTagDateEntries(occupancy, placement.tagDateEntries);
 	for (const entry of placement.hostDateEntries) {
 		const key = `${entry.hostId}|${entry.date}`;
 		if (!occupancy.hostDates.has(key)) occupancy.hostDates.set(key, []);
@@ -2089,7 +2248,9 @@ function addSolverOccupancyForPlacement(occupancy, placement) {
 
 function removeSolverOccupancyForPlacement(occupancy, placement) {
 	for (const key of placement.roomKeys) occupancy.room.delete(key);
+	for (const key of placement.tagKeys || []) occupancy.tag.delete(key);
 	for (const key of placement.hostKeys) occupancy.host.delete(key);
+	removeSolverTagDateEntries(occupancy, placement.tagDateEntries);
 	for (const entry of placement.hostDateEntries) {
 		const key = `${entry.hostId}|${entry.date}`;
 		const entries = occupancy.hostDates.get(key) || [];
@@ -2109,6 +2270,8 @@ function removeSolverOccupancyForPlacement(occupancy, placement) {
 function solverPlacementConflicts(occupancy, placement) {
 	return (
 		placement.roomKeys.some((key) => occupancy.room.has(key)) ||
+		(placement.tagKeys || []).some((key) => occupancy.tag.has(key)) ||
+		solverTagSpacingConflicts(occupancy, placement) ||
 		placement.hostKeys.some((key) => occupancy.host.has(key))
 	);
 }
@@ -2204,6 +2367,8 @@ function rankSolverPlacements(placements, occupancy, rest, domains) {
 function buildSolverInitialOccupancy(conventionId, autoEventIds) {
 	const occupancy = {
 		room: new Set(),
+		tag: new Set(),
+		tagDates: new Map(),
 		host: new Set(),
 		hostDates: new Map(),
 		roomDates: new Map()
@@ -2218,6 +2383,16 @@ function buildSolverInitialOccupancy(conventionId, autoEventIds) {
 		const startIdx = getDaySlots(conventionId, date).findIndex((slot) => slot.id === block[0]?.id);
 		addSolverOccupancyForPlacement(occupancy, {
 			roomKeys: block.map((slot) => `${schedule.room_id}|${slot.id}`),
+			tagKeys: normalizeEventTags(getUnifiedEventTags(event)).flatMap((tag) =>
+				block.map((slot) => `${tag}|${slot.id}`)
+			),
+			tagDateEntries: normalizeEventTags(getUnifiedEventTags(event)).map((tag) => ({
+				tag,
+				date,
+				startIdx,
+				slotCount: schedule.slot_count,
+				gapSlots: getEventTagGapSlotCount(conventionId)
+			})),
 			hostKeys: hostIds.flatMap((hostId) => block.map((slot) => `${hostId}|${slot.id}`)),
 			hostDateEntries: hostIds
 				.map((hostId) => ({
@@ -2273,6 +2448,14 @@ function buildSolverPlacementsForItem(item, rooms, daySlotsByDate, occupancy) {
 					capacitySlack: roomFit.capacitySlack,
 					roomOrder,
 					roomKeys: block.map((slot) => `${room.id}|${slot.id}`),
+					tagKeys: item.eventTags.flatMap((tag) => block.map((slot) => `${tag}|${slot.id}`)),
+					tagDateEntries: item.eventTags.map((tag) => ({
+						tag,
+						date,
+						startIdx: i,
+						slotCount: item.slotCount,
+						gapSlots: getEventTagGapSlotCount(item.conventionId)
+					})),
 					hostKeys: item.hostIds.flatMap((hostId) => block.map((slot) => `${hostId}|${slot.id}`)),
 					hostDateEntries: item.hostIds.map((hostId) => ({
 						hostId,
@@ -2314,6 +2497,8 @@ function cloneSolverPlan(plan) {
 function cloneSolverOccupancy(occupancy) {
 	return {
 		room: new Set(occupancy.room),
+		tag: new Set(occupancy.tag),
+		tagDates: new Map([...occupancy.tagDates].map(([key, entries]) => [key, [...entries]])),
 		host: new Set(occupancy.host),
 		hostDates: new Map([...occupancy.hostDates].map(([key, entries]) => [key, [...entries]])),
 		roomDates: new Map([...occupancy.roomDates].map(([key, entries]) => [key, [...entries]]))
@@ -2325,8 +2510,8 @@ function compareSolverItems(a, b, domains) {
 	const bOptions = domains.get(b.key)?.length ?? 0;
 	if (aOptions !== bOptions) return aOptions - bOptions;
 
-	const aRequiredTags = normalizeList(a.event?.required_room_tags).length;
-	const bRequiredTags = normalizeList(b.event?.required_room_tags).length;
+	const aRequiredTags = getEventRoomRequiredTags(a.event).length;
+	const bRequiredTags = getEventRoomRequiredTags(b.event).length;
 	if (aRequiredTags !== bRequiredTags) return bRequiredTags - aRequiredTags;
 	if (a.slotCount !== b.slotCount) return b.slotCount - a.slotCount;
 	if (a.hostIds.length !== b.hostIds.length) return b.hostIds.length - a.hostIds.length;
@@ -2389,6 +2574,14 @@ function solverStateSignature(unassigned, occupancy) {
 			.sort()
 			.join(','),
 		[...occupancy.room].sort().join(','),
+		[...occupancy.tag].sort().join(','),
+		[...occupancy.tagDates]
+			.map(
+				([key, entries]) =>
+					`${key}:${entries.map((entry) => `${entry.startIdx}-${entry.slotCount}`).sort().join(',')}`
+			)
+			.sort()
+			.join(','),
 		[...occupancy.host].sort().join(',')
 	].join('::');
 }
@@ -2964,6 +3157,18 @@ export function validateEventPlacement(eventId, roomId, startTimeSlotId, exclude
 	if (hostsConflict(hostIds, slotIds, event.id)) {
 		return { valid: false, reason: 'Prowadzący ma konflikt' };
 	}
+	const tagConflict = findEventTagConflict(
+		event.event_tags,
+		block,
+		event.id,
+		excludeScheduleId
+	);
+	if (tagConflict) {
+		return {
+			valid: false,
+			reason: `Tag „${tagConflict.tags[0]}” wymaga co najmniej godziny przerwy od „${tagConflict.event.title}”`
+		};
+	}
 
 	let worstTier = 1;
 	for (const hostId of hostIds) {
@@ -3070,6 +3275,8 @@ export function executeImportFromPreview(preview, options) {
 			updated_at: timestamp
 		});
 
+		const declaredSlotIds = new Set();
+
 		for (const event of person.events) {
 			const eventId = crypto.randomUUID();
 			eventCount++;
@@ -3088,7 +3295,8 @@ export function executeImportFromPreview(preview, options) {
 				needs_laptop: event.needs_laptop ? 1 : 0,
 				needs_speakers: event.needs_speakers ? 1 : 0,
 				estimated_attendance: normalizeNullableInteger(event.estimated_attendance),
-				required_room_tags: normalizeList(event.required_room_tags),
+				required_room_tags: [],
+				event_tags: mergeTagLists(event.event_tags, event.required_room_tags),
 				equipment_needs: normalizeList(event.equipment_needs),
 				source_row_hash: event.source_row_hash,
 				created_at: timestamp,
@@ -3100,8 +3308,10 @@ export function executeImportFromPreview(preview, options) {
 			const tierSlots = expandAvailabilityToSlots(event.availability, slotsByDateTime, slotMinutes);
 
 			for (const { slotId, tier } of tierSlots) {
-				upsertAvailability(personId, slotId, tier, timestamp);
-				availabilityCount++;
+				declaredSlotIds.add(slotId);
+				if (upsertAvailability(personId, slotId, tier, timestamp)) {
+					availabilityCount++;
+				}
 			}
 		}
 
@@ -3111,14 +3321,12 @@ export function executeImportFromPreview(preview, options) {
 		// them to "available". People who picked "whole convention" / "rather
 		// not", or whose answer produced no usable slots, stay available
 		// everywhere (tier 1) so the plan can still be fully filled.
-		const declaredSlotIds = new Set(
-			state.availability.filter((a) => a.person_id === personId).map((a) => a.time_slot_id)
-		);
 		if (declaredSlotIds.size > 0 && declaredSlotIds.size < conventionSlotIds.length) {
 			for (const slotId of conventionSlotIds) {
 				if (!declaredSlotIds.has(slotId)) {
-					upsertAvailability(personId, slotId, 3, timestamp);
-					availabilityCount++;
+					if (upsertAvailability(personId, slotId, 3, timestamp)) {
+						availabilityCount++;
+					}
 				}
 			}
 		} else {
@@ -3228,10 +3436,6 @@ export function createManualConvention(options) {
 			updated_at: timestamp
 		});
 
-		for (const slot of conventionSlots) {
-			upsertAvailability(personId, slot.id, 1, timestamp);
-		}
-
 		for (const event of entry.events || []) {
 			const title = event.title?.trim();
 			if (!title) continue;
@@ -3256,7 +3460,8 @@ export function createManualConvention(options) {
 				needs_laptop: event.needs_laptop ? 1 : 0,
 				needs_speakers: event.needs_speakers ? 1 : 0,
 				estimated_attendance: normalizeNullableInteger(event.estimated_attendance),
-				required_room_tags: normalizeList(event.required_room_tags),
+				required_room_tags: [],
+				event_tags: mergeTagLists(event.event_tags, event.required_room_tags),
 				equipment_needs: normalizeList(event.equipment_needs),
 				source_row_hash: null,
 				created_at: timestamp,
@@ -3281,11 +3486,32 @@ export function createManualConvention(options) {
 		peopleCount,
 		eventCount,
 		slotCount,
-		availabilityCount: peopleCount * conventionSlots.length
+		availabilityCount: state.availability.filter((row) =>
+			conventionSlots.some((slot) => slot.id === row.time_slot_id)
+		).length
 	};
 }
 
 export function clearAllData() {
 	state = createEmptyState();
 	persist();
+}
+
+export function exportPlanJson() {
+	ensureLoaded();
+	const active = getActiveConvention();
+	const envelope = serializePlan(state, { conventionName: active?.name ?? null });
+	return JSON.stringify(envelope, null, 2);
+}
+
+export function importPlanJson(jsonString) {
+	ensureLoaded();
+	const data = parsePlanJson(jsonString);
+	state = { ...createEmptyState(), ...data };
+	migrateLoadedState();
+	persist();
+	return {
+		active: getActiveConvention(),
+		summary: describePlan(data)
+	};
 }

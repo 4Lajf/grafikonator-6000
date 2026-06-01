@@ -16,9 +16,11 @@
 		EVENT_TIER_OPTIONS
 	} from '$lib/database.js';
 	import Button from '$lib/components/ui/button/button.svelte';
+	import { buttonVariants } from '$lib/components/ui/button/index.js';
 	import Card from '$lib/components/ui/card/card.svelte';
 	import Input from '$lib/components/ui/input/input.svelte';
 	import Label from '$lib/components/ui/label/label.svelte';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { toast } from 'svelte-sonner';
 
 	let convention = $state(null);
@@ -33,6 +35,7 @@
 	let editingEvent = $state(null);
 	let newEvent = $state(null);
 	let newPerson = $state(null);
+	let showDeletePersonDialog = $state(false);
 
 	onMount(async () => {
 		await loadData();
@@ -91,8 +94,12 @@
 		}
 	}
 
-	async function handleDeletePerson() {
-		if (!confirm(`Usunąć ${selectedPerson.display_name}? Najpierw musisz usunąć wszystkie atrakcje tej osoby.`)) return;
+	function handleDeletePerson() {
+		showDeletePersonDialog = true;
+	}
+
+	async function confirmDeletePerson() {
+		showDeletePersonDialog = false;
 		saving = true;
 		try {
 			await deletePerson(selectedPerson.id);
@@ -589,3 +596,35 @@
 		</div>
 	{/if}
 </div>
+
+<AlertDialog.Root bind:open={showDeletePersonDialog}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>Usunąć {selectedPerson?.display_name}?</AlertDialog.Title>
+			<AlertDialog.Description>
+				{#if personDetails?.events?.length}
+					{@const eventCount = personDetails.events.length}
+					{@const eventLabel =
+						eventCount === 1 ? 'atrakcję' : eventCount >= 2 && eventCount <= 4 ? 'atrakcje' : 'atrakcji'}
+					Usunięcie tej osoby spowoduje również trwałe usunięcie {eventCount} {eventLabel}.
+					{#if personDetails.events.some((event) => event.schedule)}
+						Atrakcje wpisane w grafiku zostaną z niego usunięte.
+					{/if}
+					Tej operacji nie można cofnąć.
+				{:else}
+					Usunięcie tej osoby jest nieodwracalne. Dyspozycyjność również zostanie usunięta.
+				{/if}
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>Anuluj</AlertDialog.Cancel>
+			<AlertDialog.Action
+				class={buttonVariants({ variant: 'destructive' })}
+				onclick={confirmDeletePerson}
+				disabled={saving}
+			>
+				Usuń osobę
+			</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>

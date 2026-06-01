@@ -5,9 +5,11 @@ import {
 	clearAllData,
 	createConvention,
 	createEvent,
+	createSchedule,
 	executeImportFromPreview,
 	createPerson,
 	createRoom,
+	getAvailability,
 	generateTimeSlotsForConvention,
 	getSchedules,
 	getTimeSlots,
@@ -54,6 +56,26 @@ describe('autoScheduleEvent', () => {
 		const slots = getTimeSlots(convention.id);
 		expect(slots.filter((slot) => slot.date === '2023-09-30')).toHaveLength(3);
 		expect(slots.filter((slot) => slot.date === '2023-10-01')).toHaveLength(2);
+	});
+
+	it('stores only non-default availability rows', () => {
+		const convention = createConvention({
+			name: 'Sparse availability',
+			start_date: '2026-06-01',
+			end_date: '2026-06-01',
+			slot_minutes: 60,
+			day_start_hour: 10,
+			day_end_hour: 11
+		});
+		generateTimeSlotsForConvention(convention.id);
+		const [slot] = getTimeSlots(convention.id);
+		const person = createPerson(convention.id, { display_name: 'Sparse Host' });
+
+		setAvailability(person.id, slot.id, 3);
+		expect(getAvailability(convention.id, null, person.id)).toHaveLength(1);
+
+		setAvailability(person.id, slot.id, 1);
+		expect(getAvailability(convention.id, null, person.id)).toHaveLength(0);
 	});
 
 	it('recursively reshuffles scheduled events to fit a constrained event', async () => {
@@ -134,6 +156,80 @@ describe('autoScheduleEvent', () => {
 		const validation = validateEventPlacement(event.id, room.id, slot.id);
 		expect(validation.valid).toBe(true);
 		expect(validation.info).toContain('Tier atrakcji T3');
+	});
+
+	it('requires a one-hour gap between same-tag events across rooms', () => {
+		const convention = createConvention({
+			name: 'Tag validation',
+			start_date: '2026-06-01',
+			end_date: '2026-06-01',
+			slot_minutes: 60,
+			day_start_hour: 10,
+			day_end_hour: 13
+		});
+		const roomA = createRoom(convention.id, { name: 'Room A' });
+		const roomB = createRoom(convention.id, { name: 'Room B' });
+		generateTimeSlotsForConvention(convention.id);
+
+		const slots = getTimeSlots(convention.id);
+		const hostA = createPerson(convention.id, { display_name: 'Host A' });
+		const hostB = createPerson(convention.id, { display_name: 'Host B' });
+		const eventA = createEvent(convention.id, hostA.id, {
+			title: 'First JoJo panel',
+			duration_minutes: 60,
+			event_tags: ['jojo']
+		});
+		const eventB = createEvent(convention.id, hostB.id, {
+			title: 'Second JoJo panel',
+			duration_minutes: 60,
+			event_tags: ['JoJo']
+		});
+
+		createSchedule({
+			event_id: eventA.id,
+			room_id: roomA.id,
+			start_time_slot_id: slots[0].id,
+			slot_count: 1
+		});
+
+		const adjacentValidation = validateEventPlacement(eventB.id, roomB.id, slots[1].id);
+		expect(adjacentValidation.valid).toBe(false);
+		expect(adjacentValidation.reason).toContain('godziny przerwy');
+
+		const spacedValidation = validateEventPlacement(eventB.id, roomB.id, slots[2].id);
+		expect(spacedValidation.valid).toBe(true);
+	});
+
+	it('uses event tags as room requirements when the tag exists on rooms', () => {
+		const convention = createConvention({
+			name: 'Shared tag namespace',
+			start_date: '2026-06-01',
+			end_date: '2026-06-01',
+			slot_minutes: 60,
+			day_start_hour: 10,
+			day_end_hour: 12
+		});
+		const plainRoom = createRoom(convention.id, { name: 'Plain room', capabilities: { tags: [] } });
+		const projectorRoom = createRoom(convention.id, {
+			name: 'Projector room',
+			capabilities: { tags: ['projector'] }
+		});
+		generateTimeSlotsForConvention(convention.id);
+
+		const [slot] = getTimeSlots(convention.id);
+		const host = createPerson(convention.id, { display_name: 'Host' });
+		const event = createEvent(convention.id, host.id, {
+			title: 'Needs projector',
+			duration_minutes: 60,
+			event_tags: ['projector']
+		});
+
+		const plainValidation = validateEventPlacement(event.id, plainRoom.id, slot.id);
+		expect(plainValidation.valid).toBe(false);
+		expect(plainValidation.reason).toContain('projector');
+
+		const projectorValidation = validateEventPlacement(event.id, projectorRoom.id, slot.id);
+		expect(projectorValidation.valid).toBe(true);
 	});
 
 	it('applies slot popularity tiers from import settings', () => {
@@ -228,6 +324,48 @@ describe('autoScheduleEvent', () => {
 
 		expect(result.errors).toHaveLength(0);
 		expect(getSchedules(convention.id)).toHaveLength(3);
+	});
+
+	it('auto-schedules same-tag events with at least one hour between them', async () => {
+		const convention = createConvention({
+			name: 'Tag-aware solver',
+			start_date: '2026-06-01',
+			end_date: '2026-06-01',
+			slot_minutes: 60,
+			day_start_hour: 10,
+			day_end_hour: 13
+		});
+		createRoom(convention.id, { name: 'Room A' });
+		createRoom(convention.id, { name: 'Room B' });
+		generateTimeSlotsForConvention(convention.id);
+
+		const slots = getTimeSlots(convention.id);
+		const hostA = createPerson(convention.id, { display_name: 'Host A' });
+		const hostB = createPerson(convention.id, { display_name: 'Host B' });
+		for (const slot of slots) {
+			setAvailability(hostA.id, slot.id, 1);
+			setAvailability(hostB.id, slot.id, 1);
+		}
+		createEvent(convention.id, hostA.id, {
+			title: 'JoJo Ships',
+			duration_minutes: 60,
+			event_tags: ['jojo']
+		});
+		createEvent(convention.id, hostB.id, {
+			title: 'JoJo Concert',
+			duration_minutes: 60,
+			event_tags: ['JOJO']
+		});
+
+		const result = await autoScheduleAll(convention.id);
+		const schedules = getSchedules(convention.id);
+
+		expect(result.errors).toHaveLength(0);
+		expect(schedules).toHaveLength(2);
+		const scheduledIndexes = schedules
+			.map((schedule) => slots.findIndex((slot) => slot.id === schedule.start_time_slot_id))
+			.sort((a, b) => a - b);
+		expect(scheduledIndexes[1] - scheduledIndexes[0]).toBeGreaterThanOrEqual(2);
 	});
 
 	it('keeps contiguous room for longer events before optimizing hype tiers', async () => {

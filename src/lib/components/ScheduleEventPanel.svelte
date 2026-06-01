@@ -35,7 +35,7 @@
 	let eventTier = $state(2);
 	let autoSchedule = $state(true);
 	let estimatedAttendance = $state('');
-	let requiredRoomTags = $state('');
+	let eventTags = $state('');
 	let eventKind = $state('');
 	let scheduleForm = $state(null);
 	let validationMessage = $state('');
@@ -82,8 +82,11 @@
 	const panelEstimatedAttendance = $derived(
 		schedule?.event?.estimated_attendance ?? unscheduledEvent?.estimated_attendance ?? ''
 	);
-	const panelRequiredRoomTags = $derived(
-		(schedule?.event?.required_room_tags ?? unscheduledEvent?.required_room_tags ?? []).join(', ')
+	const panelEventTags = $derived(
+		[
+			...(schedule?.event?.event_tags ?? unscheduledEvent?.event_tags ?? []),
+			...(schedule?.event?.required_room_tags ?? unscheduledEvent?.required_room_tags ?? [])
+		].join(', ')
 	);
 	const panelEventKind = $derived(schedule?.event?.kind ?? unscheduledEvent?.kind ?? '');
 	const scheduleLocked = $derived(schedule?.locked === true);
@@ -130,7 +133,7 @@
 	const eventMetadataDirty = $derived(
 		eventId != null &&
 			(String(estimatedAttendance) !== String(panelEstimatedAttendance ?? '') ||
-				requiredRoomTags !== panelRequiredRoomTags ||
+				eventTags !== panelEventTags ||
 				eventKind !== panelEventKind)
 	);
 	const eventSettingsDirty = $derived(eventTierDirty || autoScheduleDirty || eventMetadataDirty);
@@ -174,7 +177,7 @@
 		eventTier = Number(schedule?.event?.tier ?? unscheduledEvent?.tier ?? 2);
 		autoSchedule = (schedule?.event?.auto_schedule ?? unscheduledEvent?.auto_schedule ?? 1) !== 0;
 		estimatedAttendance = String(panelEstimatedAttendance ?? '');
-		requiredRoomTags = panelRequiredRoomTags;
+		eventTags = panelEventTags;
 		eventKind = panelEventKind;
 		if (schedule) {
 			scheduleForm = {
@@ -256,6 +259,23 @@
 		saving = true;
 		try {
 			if (scheduleDirty) {
+				const validation = unscheduledEvent
+					? await validateEventPlacement(
+							unscheduledEvent.id,
+							scheduleForm.room_id,
+							scheduleForm.start_time_slot_id
+						)
+					: await validateScheduleMove(
+							schedule.id,
+							scheduleForm.room_id,
+							scheduleForm.start_time_slot_id
+						);
+				if (!validation.valid) {
+					validationSeverity = 'error';
+					validationMessage = validation.reason || 'Konflikt w grafiku';
+					toast.error(validationMessage);
+					return;
+				}
 				if (unscheduledEvent) {
 					await createSchedule({
 						event_id: unscheduledEvent.id,
@@ -296,7 +316,7 @@
 					tier: Number(eventTier),
 					auto_schedule: Boolean(autoSchedule),
 					estimated_attendance: estimatedAttendance,
-					required_room_tags: requiredRoomTags,
+					event_tags: eventTags,
 					kind: eventKind.trim() || null
 				});
 			}
@@ -456,7 +476,7 @@
 				</section>
 
 				<section class="panel-section">
-					<h3>Wymagania sali</h3>
+					<h3>Tagi</h3>
 					<div class="panel-form-grid">
 						<label class="panel-field">
 							<span>Szacowana frekwencja</span>
@@ -467,8 +487,12 @@
 							<input bind:value={eventKind} placeholder="np. Prelekcja, Konkurs, Warsztaty" />
 						</label>
 						<label class="panel-field panel-field--full">
-							<span>Wymagane tagi sali</span>
-							<input bind:value={requiredRoomTags} placeholder="projector, quiet_room" />
+							<span>Tagi atrakcji / sali</span>
+							<input bind:value={eventTags} placeholder="jojo, koncert, projector" />
+							<small>
+								Tag zgodny z tagiem sali działa jak wymaganie sali; tag zgodny z inną
+								atrakcją pilnuje odstępu tematycznego.
+							</small>
 						</label>
 					</div>
 				</section>

@@ -15,6 +15,7 @@
 	import Label from '$lib/components/ui/label/label.svelte';
 	import { toast } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
+	import { normalizeHourWindow } from '$lib/convention-hours.js';
 
 	const CSV_STEPS = ['Wgraj', 'Mapowanie', 'Ustawienia', 'Podgląd'];
 	const MANUAL_STEPS = ['Ustawienia', 'Osoby i atrakcje', 'Podsumowanie'];
@@ -100,17 +101,23 @@
 		const parsed = Number(value);
 		conventionConfig = {
 			...conventionConfig,
-			daySettings: (conventionConfig.daySettings || []).map((day) =>
-				day.date === date ? { ...day, [key]: Number.isFinite(parsed) ? parsed : day[key] } : day
-			)
+			daySettings: (conventionConfig.daySettings || []).map((day) => {
+				if (day.date !== date) return day;
+				const draft = {
+					...day,
+					[key]: Number.isFinite(parsed) ? parsed : day[key]
+				};
+				return { ...draft, ...normalizeHourWindow(draft.startHour, draft.endHour) };
+			})
 		};
 	}
 
 	function listSlotsForDay(day) {
 		const slots = [];
 		const slotMinutes = Number(conventionConfig.slotMinutes) || 30;
-		const start = Number(day.startHour) * 60;
-		const end = Number(day.endHour) * 60;
+		const { startHour, endHour } = normalizeHourWindow(day.startHour, day.endHour);
+		const start = startHour * 60;
+		const end = endHour * 60;
 		for (let total = start; total < end; total += slotMinutes) {
 			const h = Math.floor(total / 60);
 			const m = total % 60;

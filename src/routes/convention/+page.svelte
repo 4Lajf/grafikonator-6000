@@ -18,6 +18,7 @@
 	import Input from '$lib/components/ui/input/input.svelte';
 	import Label from '$lib/components/ui/label/label.svelte';
 	import { toast } from 'svelte-sonner';
+	import { normalizeHourWindow } from '$lib/convention-hours.js';
 
 	let loading = $state(true);
 	let savingSettings = $state(false);
@@ -98,9 +99,14 @@
 		const parsed = Number(value);
 		form = {
 			...form,
-			daySettings: (form.daySettings || []).map((day) =>
-				day.date === date ? { ...day, [key]: Number.isFinite(parsed) ? parsed : day[key] } : day
-			)
+			daySettings: (form.daySettings || []).map((day) => {
+				if (day.date !== date) return day;
+				const draft = {
+					...day,
+					[key]: Number.isFinite(parsed) ? parsed : day[key]
+				};
+				return { ...draft, ...normalizeHourWindow(draft.startHour, draft.endHour) };
+			})
 		};
 	}
 
