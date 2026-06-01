@@ -5,6 +5,7 @@
 		getPeople,
 		getPersonWithDetails,
 		getPersonAvailabilityGrid,
+		createPerson,
 		updatePerson,
 		deletePerson,
 		createEvent,
@@ -31,6 +32,7 @@
 	let editingPerson = $state(null);
 	let editingEvent = $state(null);
 	let newEvent = $state(null);
+	let newPerson = $state(null);
 
 	onMount(async () => {
 		await loadData();
@@ -148,6 +150,79 @@
 		}
 	}
 
+	function startNewPerson() {
+		selectedPerson = null;
+		personDetails = null;
+		availabilityGrid = [];
+		editingPerson = null;
+		editingEvent = null;
+		newEvent = null;
+		newPerson = {
+			display_name: '',
+			phone: '',
+			notes: '',
+			events: [{ title: '', duration_minutes: 60, tier: 2 }]
+		};
+	}
+
+	function addNewPersonEvent() {
+		newPerson = {
+			...newPerson,
+			events: [...newPerson.events, { title: '', duration_minutes: 60, tier: 2 }]
+		};
+	}
+
+	function removeNewPersonEvent(index) {
+		if (newPerson.events.length <= 1) return;
+		newPerson = {
+			...newPerson,
+			events: newPerson.events.filter((_, i) => i !== index)
+		};
+	}
+
+	async function saveNewPerson() {
+		const displayName = newPerson.display_name.trim();
+		if (!displayName) {
+			toast.error('Podaj pseudonim osoby');
+			return;
+		}
+
+		const events = newPerson.events.filter(
+			(e) => e.title.trim() && Number(e.duration_minutes) > 0
+		);
+		const partialEvents = newPerson.events.filter(
+			(e) => (e.title.trim() && !(Number(e.duration_minutes) > 0)) || (!e.title.trim() && Number(e.duration_minutes) > 0)
+		);
+		if (partialEvents.length > 0) {
+			toast.error('Uzupełnij tytuł i czas trwania każdej atrakcji');
+			return;
+		}
+
+		saving = true;
+		try {
+			const person = await createPerson(convention.id, {
+				display_name: displayName,
+				phone: newPerson.phone,
+				notes: newPerson.notes
+			});
+			for (const event of events) {
+				await createEvent(convention.id, person.id, {
+					title: event.title.trim(),
+					duration_minutes: Number(event.duration_minutes),
+					tier: event.tier
+				});
+			}
+			toast.success(events.length ? 'Dodano osobę z atrakcjami' : 'Dodano osobę');
+			newPerson = null;
+			await loadData();
+			await selectPerson(person);
+		} catch (error) {
+			toast.error('Błąd zapisu', { description: error.message });
+		} finally {
+			saving = false;
+		}
+	}
+
 	function startNewEvent() {
 		newEvent = {
 			title: '',
@@ -219,7 +294,10 @@
 		<div class="flex gap-6">
 			<aside class="w-64 shrink-0">
 				<Card class="p-4">
-					<h2 class="g-section-title mb-3">Osoby ({people.length})</h2>
+					<div class="mb-3 flex items-center justify-between gap-2">
+						<h2 class="g-section-title">Osoby ({people.length})</h2>
+						<Button size="sm" variant="outline" onclick={startNewPerson}>+ Osoba</Button>
+					</div>
 					<div class="max-h-[70vh] space-y-1 overflow-y-auto">
 						{#each people as person}
 							<button
@@ -238,9 +316,95 @@
 			</aside>
 
 			<main class="flex-1 min-w-0 space-y-6">
-				{#if !selectedPerson}
+				{#if newPerson}
+					<Card class="p-6 space-y-4">
+						<div class="flex items-center justify-between">
+							<h2 class="g-section-title">Nowa osoba</h2>
+							<Button size="sm" variant="outline" onclick={() => (newPerson = null)}>Anuluj</Button>
+						</div>
+						<p class="text-sm text-muted-foreground">
+							Dyspozycyjność zostanie ustawiona na „mogę” we wszystkich slotach.
+						</p>
+
+						<div class="g-surface grid grid-cols-2 gap-4">
+							<div>
+								<Label for="new-person-name">Pseudonim</Label>
+								<Input id="new-person-name" bind:value={newPerson.display_name} placeholder="np. Kitsu" />
+							</div>
+							<div>
+								<Label for="new-person-phone">Telefon</Label>
+								<Input id="new-person-phone" bind:value={newPerson.phone} />
+							</div>
+							<div class="col-span-2">
+								<Label for="new-person-notes">Notatki</Label>
+								<textarea
+									id="new-person-notes"
+									class="g-textarea"
+									rows="2"
+									bind:value={newPerson.notes}
+								></textarea>
+							</div>
+						</div>
+
+						<div class="space-y-3">
+							<h3 class="font-medium">Atrakcje</h3>
+							{#each newPerson.events as event, eventIndex}
+								<div class="g-surface grid grid-cols-2 gap-3">
+									<div class="col-span-2">
+										<Label for="new-person-event-title-{eventIndex}">Tytuł</Label>
+										<Input
+											id="new-person-event-title-{eventIndex}"
+											bind:value={event.title}
+											placeholder="np. Warsztat origami"
+										/>
+									</div>
+									<div>
+										<Label for="new-person-event-duration-{eventIndex}">Czas trwania (min)</Label>
+										<Input
+											id="new-person-event-duration-{eventIndex}"
+											type="number"
+											min="1"
+											bind:value={event.duration_minutes}
+										/>
+									</div>
+									<div>
+										<Label for="new-person-event-tier-{eventIndex}">Tier atrakcji</Label>
+										<select
+											id="new-person-event-tier-{eventIndex}"
+											class="g-select"
+											bind:value={event.tier}
+										>
+											{#each EVENT_TIER_OPTIONS as tier}
+												<option value={tier.value}>{tier.label}</option>
+											{/each}
+										</select>
+									</div>
+									{#if newPerson.events.length > 1}
+										<div class="col-span-2">
+											<Button
+												size="sm"
+												variant="outline"
+												onclick={() => removeNewPersonEvent(eventIndex)}
+											>
+												Usuń atrakcję
+											</Button>
+										</div>
+									{/if}
+								</div>
+							{/each}
+							<Button size="sm" variant="outline" onclick={addNewPersonEvent}>+ Atrakcja</Button>
+						</div>
+
+						<div class="flex gap-2">
+							<Button onclick={saveNewPerson} disabled={saving}>Dodaj osobę</Button>
+							<Button variant="outline" onclick={() => (newPerson = null)} disabled={saving}>
+								Anuluj
+							</Button>
+						</div>
+					</Card>
+				{:else if !selectedPerson}
 					<Card class="p-8 text-center text-muted-foreground">
-						Wybierz osobę z listy po lewej stronie, aby edytować jej dane.
+						Wybierz osobę z listy po lewej stronie albo dodaj nową.
 					</Card>
 				{:else if personDetails}
 					<Card class="p-6">

@@ -596,18 +596,22 @@ export function getPeople(conventionId) {
 
 export function createPerson(conventionId, data) {
 	ensureLoaded();
+	const displayName = String(data.display_name || '').trim();
+	if (!displayName) throw new Error('Podaj pseudonim osoby');
+
 	const id = crypto.randomUUID();
 	const timestamp = now();
 	const person = {
 		id,
 		convention_id: conventionId,
-		display_name: data.display_name,
-		phone: data.phone || null,
-		notes: data.notes || null,
+		display_name: displayName,
+		phone: data.phone?.trim() || null,
+		notes: data.notes?.trim() || null,
 		created_at: timestamp,
 		updated_at: timestamp
 	};
 	state.people.push(person);
+	ensureDefaultAvailabilityForPerson(id, conventionId, timestamp);
 	persist();
 	return person;
 }
