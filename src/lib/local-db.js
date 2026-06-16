@@ -1,9 +1,26 @@
+import {
+	haveSharedTags,
+	normalizeColor,
+	normalizeScheduleMode,
+	normalizeTags,
+	SCHEDULE_MODES
+} from './scheduling/common.js';
+import { normalizeClusterLimit, normalizeEventModeSettings } from './scheduling/event-scheduler.js';
+import {
+	buildPeopleAutoSchedulePlan,
+	getRoomPreferenceTier,
+	normalizePeopleModeSettings,
+	normalizePersonSchedulingFields
+} from './scheduling/people-scheduler.js';
+
 const STORAGE_KEY = 'grafikonator-6000-data';
+const MAX_UNDO_GROUPS = 50;
 
 /** @typedef {import('./import/importer.js').PreviewResult} PreviewResult */
 
 function createEmptyState() {
 	return {
+		active_convention_id: null,
 		conventions: [],
 		people: [],
 		rooms: [],
@@ -12,6 +29,8 @@ function createEmptyState() {
 		time_slots: [],
 		availability: [],
 		schedules: [],
+		people_schedules: [],
+		undo_history: [],
 		import_value_mappings: []
 	};
 }
@@ -122,6 +141,174 @@ function normalizeList(value) {
 		.filter(Boolean);
 }
 
+function normalizeConventionModeSettings(mode, settings = {}) {
+	const scheduleMode = normalizeScheduleMode(mode);
+	if (scheduleMode === SCHEDULE_MODES.PEOPLE) {
+		return normalizePeopleModeSettings(settings);
+	}
+	return normalizeEventModeSettings(settings);
+}
+
+function normalizeNullableColor(value) {
+	return normalizeColor(value);
+}
+
+function normalizePersonFields(value = {}) {
+	return normalizePersonSchedulingFields(value);
+}
+
+function roomNameTag(name) {
+	return String(name || '').trim();
+}
+
+function capabilitiesWithRoomNameTag(name, capabilities) {
+	const normalized = normalizeRoomCapabilities(capabilities);
+	const tag = roomNameTag(name);
+	if (tag && !normalized.tags.some((existing) => existing.toLowerCase() === tag.toLowerCase())) {
+		normalized.tags = [...normalized.tags, tag];
+	}
+	return normalized;
+}
+
+function nextRoomSortOrder(conventionId) {
+	const orders = state.rooms
+		.filter((room) => room.convention_id === conventionId)
+		.map((room) => Number(room.sort_order))
+		.filter(Number.isFinite);
+	return orders.length ? Math.max(...orders) + 1 : 0;
+}
+
+function newestConvention() {
+	return [...state.conventions].sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
+}
+
+function activeConventionRecord() {
+	return (
+		state.conventions.find((convention) => convention.id === state.active_convention_id) ??
+		newestConvention()
+	);
+}
+
+function recordUndo(conventionId, label, snapshot) {
+	if (!conventionId || !snapshot) return;
+	const entry = {
+		id: crypto.randomUUID(),
+		convention_id: conventionId,
+		label,
+		snapshot,
+		created_at: now()
+	};
+	const current = state.undo_history.filter((item) => item.convention_id === conventionId);
+	const others = state.undo_history.filter((item) => item.convention_id !== conventionId);
+	state.undo_history = [entry, ...current].slice(0, MAX_UNDO_GROUPS).concat(others);
+}
+
+function cloneSnapshot(value) {
+	if (typeof structuredClone === 'function') return structuredClone(value);
+	return JSON.parse(JSON.stringify(value));
+}
+
+function getConventionEventIds(conventionId) {
+	return new Set(
+		state.events.filter((event) => event.convention_id === conventionId).map((event) => event.id)
+	);
+}
+
+function getConventionPersonIds(conventionId) {
+	return new Set(
+		state.people.filter((person) => person.convention_id === conventionId).map((person) => person.id)
+	);
+}
+
+function snapshotScheduleState(conventionId) {
+	const eventIds = getConventionEventIds(conventionId);
+	const personIds = getConventionPersonIds(conventionId);
+	return cloneSnapshot({
+		type: 'schedules',
+		eventIds: [...eventIds],
+		personIds: [...personIds],
+		schedules: state.schedules.filter((schedule) => eventIds.has(schedule.event_id)),
+		people_schedules: state.people_schedules.filter((schedule) => personIds.has(schedule.person_id))
+	});
+}
+
+function snapshotRoomState(conventionId) {
+	const rooms = state.rooms.filter((room) => room.convention_id === conventionId);
+	return cloneSnapshot({
+		type: 'rooms',
+		rooms,
+		roomIds: rooms.map((room) => room.id)
+	});
+}
+
+function snapshotConventionState(conventionId) {
+	const eventIds = getConventionEventIds(conventionId);
+	const personIds = getConventionPersonIds(conventionId);
+	const roomIds = new Set(
+		state.rooms.filter((room) => room.convention_id === conventionId).map((room) => room.id)
+	);
+	return cloneSnapshot({
+		type: 'convention',
+		rooms: state.rooms.filter((room) => room.convention_id === conventionId),
+		events: state.events.filter((event) => event.convention_id === conventionId),
+		people: state.people.filter((person) => person.convention_id === conventionId),
+		event_hosts: state.event_hosts.filter((host) => eventIds.has(host.event_id)),
+		schedules: state.schedules.filter((schedule) => eventIds.has(schedule.event_id)),
+		people_schedules: state.people_schedules.filter((schedule) => personIds.has(schedule.person_id)),
+		availability: state.availability.filter((entry) => personIds.has(entry.person_id)),
+		time_slots: state.time_slots.filter((slot) => slot.convention_id === conventionId),
+		roomIds: [...roomIds],
+		eventIds: [...eventIds],
+		personIds: [...personIds]
+	});
+}
+
+function restoreConventionSnapshot(conventionId, snapshot) {
+	if (snapshot?.type === 'schedules') {
+		const eventIds = new Set(snapshot.eventIds ?? []);
+		const personIds = new Set(snapshot.personIds ?? []);
+		state.schedules = state.schedules
+			.filter((schedule) => !eventIds.has(schedule.event_id))
+			.concat(snapshot.schedules ?? []);
+		state.people_schedules = state.people_schedules
+			.filter((schedule) => !personIds.has(schedule.person_id))
+			.concat(snapshot.people_schedules ?? []);
+		return;
+	}
+
+	if (snapshot?.type === 'rooms') {
+		state.rooms = state.rooms
+			.filter((room) => room.convention_id !== conventionId)
+			.concat(snapshot.rooms ?? []);
+		return;
+	}
+
+	const currentEventIds = new Set(
+		state.events.filter((event) => event.convention_id === conventionId).map((event) => event.id)
+	);
+	const currentPersonIds = new Set(
+		state.people.filter((person) => person.convention_id === conventionId).map((person) => person.id)
+	);
+	state.rooms = state.rooms.filter((room) => room.convention_id !== conventionId).concat(snapshot.rooms ?? []);
+	state.events = state.events.filter((event) => event.convention_id !== conventionId).concat(snapshot.events ?? []);
+	state.people = state.people.filter((person) => person.convention_id !== conventionId).concat(snapshot.people ?? []);
+	state.event_hosts = state.event_hosts
+		.filter((host) => !currentEventIds.has(host.event_id))
+		.concat(snapshot.event_hosts ?? []);
+	state.schedules = state.schedules
+		.filter((schedule) => !currentEventIds.has(schedule.event_id))
+		.concat(snapshot.schedules ?? []);
+	state.people_schedules = state.people_schedules
+		.filter((schedule) => !currentPersonIds.has(schedule.person_id))
+		.concat(snapshot.people_schedules ?? []);
+	state.availability = state.availability
+		.filter((entry) => !currentPersonIds.has(entry.person_id))
+		.concat(snapshot.availability ?? []);
+	state.time_slots = state.time_slots
+		.filter((slot) => slot.convention_id !== conventionId)
+		.concat(snapshot.time_slots ?? []);
+}
+
 function normalizeNullableInteger(value) {
 	if (value == null || value === '') return null;
 	const parsed = Number(value);
@@ -152,13 +339,14 @@ function serializeRoomCapabilities(value) {
 	return JSON.stringify(normalizeRoomCapabilities(value));
 }
 
-function roomRecord(conventionId, name, timestamp, capabilities = roomCapabilitiesForName(name)) {
+function roomRecord(conventionId, name, timestamp, capabilities = roomCapabilitiesForName(name), sortOrder = 0) {
 	return {
 		id: crypto.randomUUID(),
 		convention_id: conventionId,
 		name,
 		description: capabilities.notes || null,
 		capabilities: serializeRoomCapabilities(capabilities),
+		sort_order: sortOrder,
 		created_at: timestamp,
 		updated_at: timestamp
 	};
@@ -282,7 +470,37 @@ function getConventionHoursForDate(convention, date, dayHoursMap = null) {
 function migrateLoadedState() {
 	let changed = false;
 
+	for (const key of ['people_schedules', 'undo_history']) {
+		if (!Array.isArray(state[key])) {
+			state[key] = [];
+			changed = true;
+		}
+	}
+
+	if (
+		state.active_convention_id &&
+		!state.conventions.some((convention) => convention.id === state.active_convention_id)
+	) {
+		state.active_convention_id = null;
+		changed = true;
+	}
+
+	if (!state.active_convention_id && state.conventions.length > 0) {
+		state.active_convention_id = newestConvention()?.id ?? null;
+		changed = true;
+	}
+
 	for (const convention of state.conventions) {
+		const mode = normalizeScheduleMode(convention.schedule_mode);
+		if (convention.schedule_mode !== mode) {
+			convention.schedule_mode = mode;
+			changed = true;
+		}
+		const settings = normalizeConventionModeSettings(mode, convention.mode_settings);
+		if (JSON.stringify(convention.mode_settings ?? {}) !== JSON.stringify(settings)) {
+			convention.mode_settings = settings;
+			changed = true;
+		}
 		const normalizedSlotMinutes = Number(convention.slot_minutes) || 30;
 		const defaults = normalizeHourWindow(
 			convention.day_start_hour ?? 8,
@@ -344,6 +562,20 @@ function migrateLoadedState() {
 			event.equipment_needs = [];
 			changed = true;
 		}
+		if (event.color !== normalizeNullableColor(event.color)) {
+			event.color = normalizeNullableColor(event.color);
+			changed = true;
+		}
+		const conflictTags = normalizeTags(event.conflict_tags);
+		if (JSON.stringify(event.conflict_tags ?? []) !== JSON.stringify(conflictTags)) {
+			event.conflict_tags = conflictTags;
+			changed = true;
+		}
+		const coScheduleTags = normalizeTags(event.co_schedule_tags);
+		if (JSON.stringify(event.co_schedule_tags ?? []) !== JSON.stringify(coScheduleTags)) {
+			event.co_schedule_tags = coScheduleTags;
+			changed = true;
+		}
 		if (!event.kind && event.interaction_level) {
 			event.kind = event.interaction_level;
 			changed = true;
@@ -354,6 +586,32 @@ function migrateLoadedState() {
 		}
 		if (event.preferred_room_tags !== undefined) {
 			delete event.preferred_room_tags;
+			changed = true;
+		}
+	}
+
+	for (const person of state.people) {
+		const fields = normalizePersonFields(person);
+		for (const key of ['min_blocks', 'max_blocks']) {
+			if (person[key] !== fields[key]) {
+				person[key] = fields[key];
+				changed = true;
+			}
+		}
+		if (person.color !== normalizeNullableColor(person.color)) {
+			person.color = normalizeNullableColor(person.color);
+			changed = true;
+		}
+		if (JSON.stringify(person.conflict_tags ?? []) !== JSON.stringify(fields.conflict_tags)) {
+			person.conflict_tags = fields.conflict_tags;
+			changed = true;
+		}
+		if (JSON.stringify(person.co_schedule_tags ?? []) !== JSON.stringify(fields.co_schedule_tags)) {
+			person.co_schedule_tags = fields.co_schedule_tags;
+			changed = true;
+		}
+		if (JSON.stringify(person.tag_preferences ?? {}) !== JSON.stringify(fields.tag_preferences)) {
+			person.tag_preferences = fields.tag_preferences;
 			changed = true;
 		}
 	}
@@ -382,18 +640,31 @@ function migrateLoadedState() {
 		}
 	}
 
-	for (const room of state.rooms) {
+	const roomOrderByConvention = new Map();
+	for (const room of [...state.rooms].sort((a, b) => {
+		if (a.convention_id !== b.convention_id) return a.convention_id.localeCompare(b.convention_id);
+		return a.name.localeCompare(b.name);
+	})) {
+		if (!roomOrderByConvention.has(room.convention_id)) roomOrderByConvention.set(room.convention_id, 0);
+		if (!Number.isFinite(Number(room.sort_order))) {
+			room.sort_order = roomOrderByConvention.get(room.convention_id);
+			changed = true;
+		}
+		roomOrderByConvention.set(room.convention_id, roomOrderByConvention.get(room.convention_id) + 1);
 		const defaults = roomCapabilitiesForName(room.name);
 		const current = normalizeRoomCapabilities(room.capabilities ?? defaults);
+		const convention = state.conventions.find((entry) => entry.id === room.convention_id);
+		const peopleMode = normalizeScheduleMode(convention?.schedule_mode) === SCHEDULE_MODES.PEOPLE;
 		const currentCapacity = current.capacity ?? 0;
 		const defaultCapacity = defaults.capacity ?? 0;
-		const normalized = {
+		let normalized = {
 			...current,
 			capacity: Math.max(currentCapacity, defaultCapacity) || null,
 			tags: [...defaults.tags],
 			noisePolicy: current.noisePolicy ?? defaults.noisePolicy,
 			notes: current.notes ?? defaults.notes
 		};
+		if (peopleMode) normalized = capabilitiesWithRoomNameTag(room.name, normalized);
 		const serialized = serializeRoomCapabilities(normalized);
 		if (room.capabilities !== serialized) {
 			room.capabilities = serialized;
@@ -416,7 +687,7 @@ function ensureLoaded() {
 			state = { ...createEmptyState(), ...JSON.parse(raw) };
 		}
 		if (migrateLoadedState()) {
-			localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+			persist();
 		}
 	} catch {
 		state = createEmptyState();
@@ -424,9 +695,48 @@ function ensureLoaded() {
 	loaded = true;
 }
 
+function isQuotaExceededError(error) {
+	return (
+		error?.name === 'QuotaExceededError' ||
+		error?.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+		error?.code === 22 ||
+		error?.code === 1014
+	);
+}
+
+function dropOldestUndoEntry() {
+	if (!state.undo_history.length) return false;
+	let oldestIndex = 0;
+	for (let i = 1; i < state.undo_history.length; i++) {
+		const currentCreatedAt = state.undo_history[i].created_at ?? '';
+		const oldestCreatedAt = state.undo_history[oldestIndex].created_at ?? '';
+		if (currentCreatedAt < oldestCreatedAt || (currentCreatedAt === oldestCreatedAt && i > oldestIndex)) {
+			oldestIndex = i;
+		}
+	}
+	state.undo_history = state.undo_history.filter((_, index) => index !== oldestIndex);
+	return true;
+}
+
 function persist() {
 	if (typeof localStorage === 'undefined') return;
-	localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+	try {
+		localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+		return;
+	} catch (error) {
+		if (!isQuotaExceededError(error)) throw error;
+	}
+
+	while (dropOldestUndoEntry()) {
+		try {
+			localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+			return;
+		} catch (error) {
+			if (!isQuotaExceededError(error)) throw error;
+		}
+	}
+
+	throw new Error('Nie można zapisać danych lokalnie: pamięć przeglądarki jest pełna.');
 }
 
 function now() {
@@ -462,14 +772,15 @@ export function getConvention(id) {
 
 export function getActiveConvention() {
 	ensureLoaded();
-	if (state.conventions.length === 0) return null;
-	return [...state.conventions].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+	return activeConventionRecord();
 }
 
 export function getConventions() {
+	const active = getActiveConvention();
 	return {
 		conventions: getConventionsList(),
-		active: getActiveConvention()
+		active,
+		activeId: active?.id ?? null
 	};
 }
 
@@ -478,6 +789,7 @@ export function createConvention(data) {
 	const id = crypto.randomUUID();
 	const timestamp = now();
 	const slotMinutes = Number(data.slot_minutes) || 30;
+	const scheduleMode = normalizeScheduleMode(data.schedule_mode);
 	const defaultHours = normalizeHourWindow(data.day_start_hour ?? 8, data.day_end_hour ?? 22);
 	const dayHours = normalizeConventionDayHours(
 		data.day_hours,
@@ -495,12 +807,73 @@ export function createConvention(data) {
 		day_start_hour: defaultHours.startHour,
 		day_end_hour: defaultHours.endHour,
 		day_hours: dayHours,
+		schedule_mode: scheduleMode,
+		mode_settings: normalizeConventionModeSettings(scheduleMode, data.mode_settings),
 		created_at: timestamp,
 		updated_at: timestamp
 	};
 	state.conventions.push(convention);
+	state.active_convention_id = id;
 	persist();
 	return convention;
+}
+
+export function setActiveConvention(id) {
+	ensureLoaded();
+	const convention = state.conventions.find((entry) => entry.id === id);
+	if (!convention) throw new Error('Nie znaleziono profilu');
+	state.active_convention_id = id;
+	persist();
+	return convention;
+}
+
+export function deleteConvention(id) {
+	ensureLoaded();
+	const convention = state.conventions.find((entry) => entry.id === id);
+	if (!convention) return { deleted: false, active: getActiveConvention() };
+
+	const eventIds = getConventionEventIds(id);
+	const personIds = getConventionPersonIds(id);
+	const roomIds = new Set(
+		state.rooms.filter((room) => room.convention_id === id).map((room) => room.id)
+	);
+	const slotIds = new Set(
+		state.time_slots.filter((slot) => slot.convention_id === id).map((slot) => slot.id)
+	);
+
+	state.conventions = state.conventions.filter((entry) => entry.id !== id);
+	state.rooms = state.rooms.filter((room) => room.convention_id !== id);
+	state.events = state.events.filter((event) => event.convention_id !== id);
+	state.people = state.people.filter((person) => person.convention_id !== id);
+	state.event_hosts = state.event_hosts.filter((host) => !eventIds.has(host.event_id));
+	state.schedules = state.schedules.filter((schedule) => !eventIds.has(schedule.event_id));
+	state.people_schedules = state.people_schedules.filter(
+		(schedule) => !personIds.has(schedule.person_id)
+	);
+	state.availability = state.availability.filter(
+		(entry) => !personIds.has(entry.person_id) && !slotIds.has(entry.time_slot_id)
+	);
+	state.time_slots = state.time_slots.filter((slot) => slot.convention_id !== id);
+	state.import_value_mappings = state.import_value_mappings.filter(
+		(mapping) => mapping.convention_id !== id
+	);
+	state.undo_history = state.undo_history.filter((entry) => entry.convention_id !== id);
+
+	if (state.active_convention_id === id) {
+		state.active_convention_id = newestConvention()?.id ?? null;
+	}
+
+	persist();
+	return {
+		deleted: true,
+		active: getActiveConvention(),
+		removed: {
+			rooms: roomIds.size,
+			events: eventIds.size,
+			people: personIds.size,
+			timeSlots: slotIds.size
+		}
+	};
 }
 
 export function updateConvention(id, updates) {
@@ -512,6 +885,15 @@ export function updateConvention(id, updates) {
 		const name = String(updates.name || '').trim();
 		if (!name) throw new Error('Nazwa konwentu nie może być pusta');
 		convention.name = name;
+	}
+	if (updates.schedule_mode !== undefined) {
+		convention.schedule_mode = normalizeScheduleMode(updates.schedule_mode);
+	}
+	if (updates.mode_settings !== undefined || updates.schedule_mode !== undefined) {
+		convention.mode_settings = normalizeConventionModeSettings(
+			convention.schedule_mode,
+			updates.mode_settings ?? convention.mode_settings
+		);
 	}
 	if (updates.start_date !== undefined) convention.start_date = updates.start_date;
 	if (updates.end_date !== undefined) convention.end_date = updates.end_date;
@@ -598,12 +980,19 @@ export function createPerson(conventionId, data) {
 	ensureLoaded();
 	const id = crypto.randomUUID();
 	const timestamp = now();
+	const fields = normalizePersonFields(data);
 	const person = {
 		id,
 		convention_id: conventionId,
 		display_name: data.display_name,
 		phone: data.phone || null,
 		notes: data.notes || null,
+		min_blocks: fields.min_blocks,
+		max_blocks: fields.max_blocks,
+		color: normalizeNullableColor(data.color),
+		conflict_tags: fields.conflict_tags,
+		co_schedule_tags: fields.co_schedule_tags,
+		tag_preferences: fields.tag_preferences,
 		created_at: timestamp,
 		updated_at: timestamp
 	};
@@ -620,6 +1009,21 @@ export function updatePerson(id, updates) {
 	if (updates.display_name !== undefined) person.display_name = updates.display_name;
 	if (updates.phone !== undefined) person.phone = updates.phone;
 	if (updates.notes !== undefined) person.notes = updates.notes;
+	if (
+		updates.min_blocks !== undefined ||
+		updates.max_blocks !== undefined ||
+		updates.conflict_tags !== undefined ||
+		updates.co_schedule_tags !== undefined ||
+		updates.tag_preferences !== undefined
+	) {
+		const fields = normalizePersonFields({ ...person, ...updates });
+		person.min_blocks = fields.min_blocks;
+		person.max_blocks = fields.max_blocks;
+		person.conflict_tags = fields.conflict_tags;
+		person.co_schedule_tags = fields.co_schedule_tags;
+		person.tag_preferences = fields.tag_preferences;
+	}
+	if (updates.color !== undefined) person.color = normalizeNullableColor(updates.color);
 	person.updated_at = now();
 
 	persist();
@@ -633,6 +1037,7 @@ export function deletePerson(id) {
 		throw new Error('Nie można usunąć osoby z atrakcjami. Najpierw usuń jej atrakcje.');
 	}
 	state.availability = state.availability.filter((a) => a.person_id !== id);
+	state.people_schedules = state.people_schedules.filter((schedule) => schedule.person_id !== id);
 	state.people = state.people.filter((p) => p.id !== id);
 	persist();
 }
@@ -662,7 +1067,12 @@ export function getRooms(conventionId) {
 	ensureLoaded();
 	return state.rooms
 		.filter((r) => r.convention_id === conventionId)
-		.sort((a, b) => a.name.localeCompare(b.name))
+		.sort((a, b) => {
+			const orderA = Number.isFinite(Number(a.sort_order)) ? Number(a.sort_order) : 0;
+			const orderB = Number.isFinite(Number(b.sort_order)) ? Number(b.sort_order) : 0;
+			if (orderA !== orderB) return orderA - orderB;
+			return a.name.localeCompare(b.name);
+		})
 		.map((room) => ({
 			...room,
 			capabilities: normalizeRoomCapabilities(room.capabilities)
@@ -673,15 +1083,21 @@ export function createRoom(conventionId, data) {
 	ensureLoaded();
 	const id = crypto.randomUUID();
 	const timestamp = now();
-	const capabilities = normalizeRoomCapabilities(
+	const convention = getConvention(conventionId);
+	const baseCapabilities = normalizeRoomCapabilities(
 		data.capabilities ?? roomCapabilitiesForName(data.name)
 	);
+	const capabilities =
+		normalizeScheduleMode(convention?.schedule_mode) === SCHEDULE_MODES.PEOPLE
+			? capabilitiesWithRoomNameTag(data.name, baseCapabilities)
+			: baseCapabilities;
 	const room = {
 		id,
 		convention_id: conventionId,
 		name: data.name,
 		description: data.description || capabilities.notes || null,
 		capabilities: serializeRoomCapabilities(capabilities),
+		sort_order: nextRoomSortOrder(conventionId),
 		created_at: timestamp,
 		updated_at: timestamp
 	};
@@ -704,9 +1120,30 @@ export function updateRoom(id, updates) {
 	if (updates.capabilities !== undefined) {
 		room.capabilities = serializeRoomCapabilities(updates.capabilities);
 	}
+	if (updates.sort_order !== undefined) {
+		const sortOrder = Number(updates.sort_order);
+		if (Number.isFinite(sortOrder)) room.sort_order = Math.floor(sortOrder);
+	}
 	room.updated_at = now();
 	persist();
 	return { ...room, capabilities: normalizeRoomCapabilities(room.capabilities) };
+}
+
+export function reorderRooms(conventionId, orderedRoomIds) {
+	ensureLoaded();
+	const ids = Array.isArray(orderedRoomIds) ? orderedRoomIds : [];
+	const roomById = new Map(state.rooms.filter((room) => room.convention_id === conventionId).map((room) => [room.id, room]));
+	if (ids.some((id) => !roomById.has(id))) throw new Error('Nieprawidłowa kolejność sal');
+	const snapshot = snapshotRoomState(conventionId);
+	const timestamp = now();
+	ids.forEach((id, index) => {
+		const room = roomById.get(id);
+		room.sort_order = index;
+		room.updated_at = timestamp;
+	});
+	recordUndo(conventionId, 'Zmiana kolejności sal', snapshot);
+	persist();
+	return getRooms(conventionId);
 }
 
 export function deleteRoom(id) {
@@ -792,6 +1229,9 @@ export function createEvent(conventionId, personId, data) {
 		estimated_attendance: normalizeNullableInteger(data.estimated_attendance),
 		required_room_tags: normalizeList(data.required_room_tags),
 		equipment_needs: normalizeList(data.equipment_needs),
+		color: normalizeNullableColor(data.color),
+		conflict_tags: normalizeTags(data.conflict_tags),
+		co_schedule_tags: normalizeTags(data.co_schedule_tags),
 		source_row_hash: null,
 		created_at: timestamp,
 		updated_at: timestamp
@@ -827,6 +1267,15 @@ export function updateEvent(id, updates) {
 	}
 	if (updates.equipment_needs !== undefined) {
 		event.equipment_needs = normalizeList(updates.equipment_needs);
+	}
+	if (updates.color !== undefined) {
+		event.color = normalizeNullableColor(updates.color);
+	}
+	if (updates.conflict_tags !== undefined) {
+		event.conflict_tags = normalizeTags(updates.conflict_tags);
+	}
+	if (updates.co_schedule_tags !== undefined) {
+		event.co_schedule_tags = normalizeTags(updates.co_schedule_tags);
 	}
 	event.updated_at = now();
 
@@ -1015,6 +1464,9 @@ function pruneConventionDataForInactiveSlots(conventionId, activeSlotIds) {
 		const block = getSlotBlock(conventionId, schedule.start_time_slot_id, schedule.slot_count);
 		return block.length === schedule.slot_count;
 	});
+	state.people_schedules = state.people_schedules.filter(
+		(schedule) => !peopleIds.has(schedule.person_id) || activeSlotIds.has(schedule.time_slot_id)
+	);
 }
 
 export function generateTimeSlotsForConvention(conventionId) {
@@ -1230,6 +1682,28 @@ function upsertAvailability(personId, slotId, tier, timestamp) {
 	return record;
 }
 
+function setAvailabilityExactInternal(personId, slotId, tier, timestamp) {
+	const normalizedTier = normalizeTier(tier, 1);
+	const existing = state.availability.find(
+		(a) => a.person_id === personId && a.time_slot_id === slotId
+	);
+	if (existing) {
+		existing.tier = normalizedTier;
+		existing.updated_at = timestamp;
+		return existing;
+	}
+	const record = {
+		id: crypto.randomUUID(),
+		person_id: personId,
+		time_slot_id: slotId,
+		tier: normalizedTier,
+		created_at: timestamp,
+		updated_at: timestamp
+	};
+	state.availability.push(record);
+	return record;
+}
+
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
 function mapScheduleRow(schedule) {
@@ -1264,6 +1738,9 @@ function mapScheduleRow(schedule) {
 			estimated_attendance: event?.estimated_attendance ?? null,
 			required_room_tags: normalizeList(event?.required_room_tags),
 			equipment_needs: normalizeList(event?.equipment_needs),
+			color: normalizeNullableColor(event?.color),
+			conflict_tags: normalizeTags(event?.conflict_tags),
+			co_schedule_tags: normalizeTags(event?.co_schedule_tags),
 			host_name
 		},
 		room: {
@@ -1279,6 +1756,57 @@ function mapScheduleRow(schedule) {
 		},
 		hosts,
 		host_name
+	};
+}
+
+function mapPeopleScheduleRow(schedule) {
+	const person = state.people.find((p) => p.id === schedule.person_id);
+	const room = state.rooms.find((r) => r.id === schedule.room_id);
+	const slot = state.time_slots.find((ts) => ts.id === schedule.time_slot_id);
+	return {
+		id: schedule.id,
+		person_id: schedule.person_id,
+		room_id: schedule.room_id,
+		time_slot_id: schedule.time_slot_id,
+		start_time_slot_id: schedule.time_slot_id,
+		slot_count: 1,
+		status: schedule.status || 'scheduled',
+		locked: schedule.locked === true,
+		notes: schedule.notes || null,
+		created_at: schedule.created_at,
+		updated_at: schedule.updated_at,
+		person,
+		event: person
+			? {
+					id: person.id,
+					title: person.display_name,
+					duration_minutes: 0,
+					tier: 2,
+					auto_schedule: 1,
+					color: normalizeNullableColor(person.color),
+					conflict_tags: normalizeTags(person.conflict_tags),
+					co_schedule_tags: normalizeTags(person.co_schedule_tags),
+					host_name: person.display_name
+				}
+			: null,
+		room: room
+			? {
+					id: room.id,
+					name: room.name,
+					capabilities: normalizeRoomCapabilities(room.capabilities)
+				}
+			: null,
+		start_slot: slot
+			? {
+					id: slot.id,
+					date: slot.date,
+					start_time: slot.start_time,
+					end_time: slot.end_time
+				}
+			: null,
+		time_slot: slot,
+		hosts: person ? [{ id: person.id, display_name: person.display_name }] : [],
+		host_name: person?.display_name ?? null
 	};
 }
 
@@ -1301,6 +1829,9 @@ export function getSchedules(conventionId, date = null) {
 			if (slotA.start_time !== slotB.start_time) {
 				return slotA.start_time.localeCompare(slotB.start_time);
 			}
+			const orderA = Number.isFinite(Number(roomA?.sort_order)) ? Number(roomA.sort_order) : 0;
+			const orderB = Number.isFinite(Number(roomB?.sort_order)) ? Number(roomB.sort_order) : 0;
+			if (orderA !== orderB) return orderA - orderB;
 			return roomA.name.localeCompare(roomB.name);
 		})
 		.map(mapScheduleRow);
@@ -1313,6 +1844,8 @@ function getScheduleById(id) {
 
 export function createSchedule(data) {
 	ensureLoaded();
+	const event = state.events.find((e) => e.id === data.event_id);
+	const snapshot = event ? snapshotScheduleState(event.convention_id) : null;
 	const id = crypto.randomUUID();
 	const timestamp = now();
 	const schedule = {
@@ -1328,6 +1861,7 @@ export function createSchedule(data) {
 		updated_at: timestamp
 	};
 	state.schedules.push(schedule);
+	if (event) recordUndo(event.convention_id, 'Dodanie do grafiku', snapshot);
 	persist();
 	return getScheduleById(id);
 }
@@ -1336,6 +1870,8 @@ export function updateSchedule(id, updates) {
 	ensureLoaded();
 	const schedule = state.schedules.find((s) => s.id === id);
 	if (!schedule) return null;
+	const event = state.events.find((e) => e.id === schedule.event_id);
+	const snapshot = event ? snapshotScheduleState(event.convention_id) : null;
 
 	const changesPlacement =
 		(updates.room_id !== undefined && updates.room_id !== schedule.room_id) ||
@@ -1356,13 +1892,18 @@ export function updateSchedule(id, updates) {
 	if (updates.notes !== undefined) schedule.notes = updates.notes;
 	schedule.updated_at = now();
 
+	if (event) recordUndo(event.convention_id, 'Zmiana grafiku', snapshot);
 	persist();
 	return getScheduleById(id);
 }
 
 export function deleteSchedule(id) {
 	ensureLoaded();
+	const schedule = state.schedules.find((s) => s.id === id);
+	const event = schedule ? state.events.find((e) => e.id === schedule.event_id) : null;
+	const snapshot = event ? snapshotScheduleState(event.convention_id) : null;
 	state.schedules = state.schedules.filter((s) => s.id !== id);
+	if (event) recordUndo(event.convention_id, 'Usunięcie z grafiku', snapshot);
 	persist();
 }
 
@@ -1372,9 +1913,18 @@ export function clearAllSchedules(conventionId) {
 		state.events.filter((e) => e.convention_id === conventionId).map((e) => e.id)
 	);
 	const removed = state.schedules.filter((s) => eventIds.has(s.event_id)).length;
+	const snapshot = snapshotScheduleState(conventionId);
 	state.schedules = state.schedules.filter((s) => !eventIds.has(s.event_id));
+	let removedPeopleSchedules = 0;
+	state.people_schedules = state.people_schedules.filter((s) => {
+		const person = state.people.find((p) => p.id === s.person_id);
+		const remove = person?.convention_id === conventionId;
+		if (remove) removedPeopleSchedules++;
+		return !remove;
+	});
+	recordUndo(conventionId, 'Wyczyszczenie grafiku', snapshot);
 	persist();
-	return { removed };
+	return { removed: removed + removedPeopleSchedules };
 }
 
 export function swapSchedules(scheduleIdA, scheduleIdB) {
@@ -1382,6 +1932,8 @@ export function swapSchedules(scheduleIdA, scheduleIdB) {
 	const a = state.schedules.find((s) => s.id === scheduleIdA);
 	const b = state.schedules.find((s) => s.id === scheduleIdB);
 	if (!a || !b) throw new Error('Nie znaleziono wpisu w grafiku');
+	const event = state.events.find((e) => e.id === a.event_id);
+	const snapshot = event ? snapshotScheduleState(event.convention_id) : null;
 	if (a.locked === true || b.locked === true) {
 		throw new Error('Nie można zamienić zablokowanej pozycji');
 	}
@@ -1401,8 +1953,329 @@ export function swapSchedules(scheduleIdA, scheduleIdB) {
 	b.start_time_slot_id = aSlot;
 	b.updated_at = timestamp;
 
+	if (event) recordUndo(event.convention_id, 'Zamiana pozycji', snapshot);
 	persist();
 	return [getScheduleById(scheduleIdA), getScheduleById(scheduleIdB)];
+}
+
+export function swapPeopleSchedules(scheduleIdA, scheduleIdB) {
+	ensureLoaded();
+	const a = state.people_schedules.find((s) => s.id === scheduleIdA);
+	const b = state.people_schedules.find((s) => s.id === scheduleIdB);
+	if (!a || !b) throw new Error('Nie znaleziono wpisu w grafiku');
+	const person = state.people.find((p) => p.id === a.person_id);
+	const snapshot = person ? snapshotScheduleState(person.convention_id) : null;
+	if (a.locked === true || b.locked === true) {
+		throw new Error('Nie można zamienić zablokowanej pozycji');
+	}
+
+	// Exchange only the placement (room + slot). Occupancy validation is skipped
+	// on purpose: the caller has already gated the move on the issue engine, and
+	// the two entries trade spots atomically so neither one transiently collides.
+	const timestamp = now();
+	const aRoom = a.room_id;
+	const aSlot = a.time_slot_id;
+
+	a.room_id = b.room_id;
+	a.time_slot_id = b.time_slot_id;
+	a.updated_at = timestamp;
+
+	b.room_id = aRoom;
+	b.time_slot_id = aSlot;
+	b.updated_at = timestamp;
+
+	if (person) recordUndo(person.convention_id, 'Zamiana pozycji osób', snapshot);
+	persist();
+	return [getPeopleScheduleById(scheduleIdA), getPeopleScheduleById(scheduleIdB)];
+}
+
+export function movePeopleSchedules(moves) {
+	ensureLoaded();
+	if (!Array.isArray(moves) || moves.length === 0) return [];
+
+	const normalizedMoves = moves.map((move) => ({
+		id: move.scheduleId ?? move.schedule_id ?? move.id,
+		room_id: move.room_id,
+		time_slot_id: move.time_slot_id ?? move.start_time_slot_id
+	}));
+	const moveById = new Map();
+	let conventionId = null;
+
+	for (const move of normalizedMoves) {
+		if (!move.id) throw new Error('Brak identyfikatora wpisu');
+		const schedule = state.people_schedules.find((entry) => entry.id === move.id);
+		if (!schedule) throw new Error('Nie znaleziono wpisu w grafiku');
+		const person = state.people.find((entry) => entry.id === schedule.person_id);
+		if (!person) throw new Error('Nie znaleziono osoby');
+		conventionId = conventionId ?? person.convention_id;
+		if (person.convention_id !== conventionId) {
+			throw new Error('Nie można przenosić wpisów między profilami');
+		}
+		const nextRoomId = move.room_id ?? schedule.room_id;
+		const nextSlotId = move.time_slot_id ?? schedule.time_slot_id;
+		if (!state.rooms.some((room) => room.id === nextRoomId && room.convention_id === conventionId)) {
+			throw new Error('Nie znaleziono sali');
+		}
+		if (!state.time_slots.some((slot) => slot.id === nextSlotId && slot.convention_id === conventionId)) {
+			throw new Error('Nie znaleziono slotu');
+		}
+		if (
+			schedule.locked === true &&
+			(nextRoomId !== schedule.room_id || nextSlotId !== schedule.time_slot_id)
+		) {
+			throw new Error('Nie można przenieść zablokowanej pozycji');
+		}
+		moveById.set(schedule.id, { room_id: nextRoomId, time_slot_id: nextSlotId });
+	}
+
+	const finalSchedules = state.people_schedules
+		.map((schedule) => {
+			const person = state.people.find((entry) => entry.id === schedule.person_id);
+			if (!person || person.convention_id !== conventionId) return null;
+			const placement = moveById.get(schedule.id) ?? {
+				room_id: schedule.room_id,
+				time_slot_id: schedule.time_slot_id
+			};
+			return { ...schedule, ...placement, person };
+		})
+		.filter(Boolean);
+
+	const roomSlotOccupancy = new Map();
+	const personSlotOccupancy = new Map();
+	for (const schedule of finalSchedules) {
+		const roomSlotKey = `${schedule.room_id}|${schedule.time_slot_id}`;
+		if (roomSlotOccupancy.has(roomSlotKey)) throw new Error('Sala zajęta w tym czasie');
+		roomSlotOccupancy.set(roomSlotKey, schedule.id);
+
+		const personSlotKey = `${schedule.person_id}|${schedule.time_slot_id}`;
+		if (personSlotOccupancy.has(personSlotKey)) {
+			throw new Error(`${schedule.person.display_name}: ma już wpis w tym czasie`);
+		}
+		personSlotOccupancy.set(personSlotKey, schedule.id);
+
+		if (!moveById.has(schedule.id)) continue;
+
+		const availabilityTier = getEffectiveAvailability(schedule.person_id, schedule.time_slot_id);
+		if (availabilityTier === 3) {
+			throw new Error(`${schedule.person.display_name}: niedostępny w tym czasie`);
+		}
+		const room = state.rooms.find((entry) => entry.id === schedule.room_id);
+		const roomPreferenceTier = getRoomPreferenceTier(schedule.person, {
+			...room,
+			capabilities: normalizeRoomCapabilities(room?.capabilities)
+		});
+		if (roomPreferenceTier === 3) {
+			throw new Error(`${schedule.person.display_name}: nie chce pracować w ${room?.name ?? 'tej sali'}`);
+		}
+	}
+
+	for (let i = 0; i < finalSchedules.length; i++) {
+		for (let j = i + 1; j < finalSchedules.length; j++) {
+			const a = finalSchedules[i];
+			const b = finalSchedules[j];
+			if (!moveById.has(a.id) && !moveById.has(b.id)) continue;
+			if (a.time_slot_id !== b.time_slot_id) continue;
+			if (haveSharedTags(a.person.conflict_tags, b.person.conflict_tags)) {
+				throw new Error(`Konflikt tagów z ${b.person.display_name}`);
+			}
+		}
+	}
+
+	const snapshot = conventionId ? snapshotScheduleState(conventionId) : null;
+	const timestamp = now();
+	for (const [scheduleId, placement] of moveById) {
+		const schedule = state.people_schedules.find((entry) => entry.id === scheduleId);
+		if (!schedule) continue;
+		schedule.room_id = placement.room_id;
+		schedule.time_slot_id = placement.time_slot_id;
+		schedule.updated_at = timestamp;
+	}
+
+	if (conventionId) recordUndo(conventionId, 'Zamiana pozycji osób', snapshot);
+	persist();
+	return [...moveById.keys()].map(getPeopleScheduleById).filter(Boolean);
+}
+
+export function getPeopleSchedules(conventionId, date = null) {
+	ensureLoaded();
+	return state.people_schedules
+		.filter((schedule) => {
+			const person = state.people.find((p) => p.id === schedule.person_id);
+			if (!person || person.convention_id !== conventionId) return false;
+			if (!date) return true;
+			const slot = state.time_slots.find((ts) => ts.id === schedule.time_slot_id);
+			return slot?.date === date;
+		})
+		.sort((a, b) => {
+			const slotA = state.time_slots.find((ts) => ts.id === a.time_slot_id);
+			const slotB = state.time_slots.find((ts) => ts.id === b.time_slot_id);
+			const roomA = state.rooms.find((r) => r.id === a.room_id);
+			const roomB = state.rooms.find((r) => r.id === b.room_id);
+			if (slotA?.date !== slotB?.date) return String(slotA?.date).localeCompare(String(slotB?.date));
+			if (slotA?.start_time !== slotB?.start_time) {
+				return String(slotA?.start_time).localeCompare(String(slotB?.start_time));
+			}
+			const orderA = Number.isFinite(Number(roomA?.sort_order)) ? Number(roomA.sort_order) : 0;
+			const orderB = Number.isFinite(Number(roomB?.sort_order)) ? Number(roomB.sort_order) : 0;
+			return orderA - orderB || String(roomA?.name).localeCompare(String(roomB?.name));
+		})
+		.map(mapPeopleScheduleRow);
+}
+
+function getPeopleScheduleById(id) {
+	const schedule = state.people_schedules.find((s) => s.id === id);
+	return schedule ? mapPeopleScheduleRow(schedule) : null;
+}
+
+export function validatePersonPlacement(personId, roomId, timeSlotId, excludeScheduleId = null) {
+	ensureLoaded();
+	const person = state.people.find((p) => p.id === personId);
+	if (!person) throw new Error('Nie znaleziono osoby');
+	const room = state.rooms.find((r) => r.id === roomId);
+	if (!room) return { valid: false, reason: 'Nie znaleziono sali', code: 'room-missing' };
+	const slot = state.time_slots.find((ts) => ts.id === timeSlotId);
+	if (!slot) return { valid: false, reason: 'Nie znaleziono slotu', code: 'slot-missing' };
+	const availabilityTier = getEffectiveAvailability(personId, timeSlotId);
+	if (availabilityTier === 3) {
+		return {
+			valid: false,
+			reason: `${person.display_name}: niedostępny w tym czasie`,
+			code: 'availability-unavailable'
+		};
+	}
+	const roomPreferenceTier = getRoomPreferenceTier(person, {
+		...room,
+		capabilities: normalizeRoomCapabilities(room.capabilities)
+	});
+	if (roomPreferenceTier === 3) {
+		return {
+			valid: false,
+			reason: `${person.display_name}: nie chce pracować w ${room.name}`,
+			code: 'room-tag-unwanted'
+		};
+	}
+
+	for (const other of state.people_schedules) {
+		if (other.id === excludeScheduleId || other.time_slot_id !== timeSlotId) continue;
+		if (other.room_id === roomId) {
+			return { valid: false, reason: 'Sala zajęta w tym czasie', code: 'room-conflict' };
+		}
+		if (other.person_id === personId) {
+			return { valid: false, reason: 'Osoba ma już wpis w tym czasie', code: 'person-conflict' };
+		}
+		const otherPerson = state.people.find((p) => p.id === other.person_id);
+		if (haveSharedTags(person.conflict_tags, otherPerson?.conflict_tags)) {
+			return {
+				valid: false,
+				reason: `Konflikt tagów z ${otherPerson?.display_name ?? 'inną osobą'}`,
+				code: 'tag-conflict'
+			};
+		}
+	}
+
+	const warnings = [];
+	for (const tag of normalizeTags(person.co_schedule_tags)) {
+		const tagKey = tag.toLowerCase();
+		const related = state.people_schedules
+			.filter((other) => other.id !== excludeScheduleId)
+			.map((other) => ({
+				schedule: other,
+				person: state.people.find((p) => p.id === other.person_id)
+			}))
+			.filter(
+				({ person: otherPerson }) =>
+					otherPerson?.id !== personId &&
+					otherPerson?.convention_id === person.convention_id &&
+					normalizeTags(otherPerson?.co_schedule_tags).some(
+						(otherTag) => otherTag.toLowerCase() === tagKey
+					)
+			);
+		if (!related.length) continue;
+		if (related.some(({ schedule }) => schedule.time_slot_id === timeSlotId)) continue;
+		warnings.push(
+			`Tag wspólnego slotu nie jest razem z ${related[0].person?.display_name ?? 'inną osobą'}`
+		);
+	}
+
+	return {
+		valid: true,
+		worstTier: availabilityTier,
+		warning:
+			availabilityTier === 2
+				? `${person.display_name}: woli nie w tym czasie`
+				: roomPreferenceTier === 2
+					? `${person.display_name}: ${room.name} tylko jak będą braki`
+					: warnings[0] || null,
+		info: null
+	};
+}
+
+export function validatePeopleScheduleMove(scheduleId, roomId, timeSlotId) {
+	ensureLoaded();
+	const schedule = state.people_schedules.find((s) => s.id === scheduleId);
+	if (!schedule) throw new Error('Nie znaleziono wpisu w grafiku');
+	return validatePersonPlacement(schedule.person_id, roomId, timeSlotId, scheduleId);
+}
+
+export function createPeopleSchedule(data) {
+	ensureLoaded();
+	const person = state.people.find((p) => p.id === data.person_id);
+	if (!person) throw new Error('Nie znaleziono osoby');
+	const validation = validatePersonPlacement(data.person_id, data.room_id, data.time_slot_id);
+	if (!validation.valid) throw new Error(validation.reason);
+	const snapshot = snapshotScheduleState(person.convention_id);
+	const id = crypto.randomUUID();
+	const timestamp = now();
+	state.people_schedules.push({
+		id,
+		person_id: data.person_id,
+		room_id: data.room_id,
+		time_slot_id: data.time_slot_id,
+		status: data.status || 'scheduled',
+		locked: data.locked === true,
+		notes: data.notes || null,
+		created_at: timestamp,
+		updated_at: timestamp
+	});
+	recordUndo(person.convention_id, 'Dodanie osoby do grafiku', snapshot);
+	persist();
+	return getPeopleScheduleById(id);
+}
+
+export function updatePeopleSchedule(id, updates) {
+	ensureLoaded();
+	const schedule = state.people_schedules.find((s) => s.id === id);
+	if (!schedule) return null;
+	const person = state.people.find((p) => p.id === schedule.person_id);
+	const snapshot = person ? snapshotScheduleState(person.convention_id) : null;
+	const nextRoomId = updates.room_id ?? schedule.room_id;
+	const nextSlotId = updates.time_slot_id ?? updates.start_time_slot_id ?? schedule.time_slot_id;
+	if (schedule.locked === true && (nextRoomId !== schedule.room_id || nextSlotId !== schedule.time_slot_id)) {
+		throw new Error('Ta pozycja jest zablokowana — odblokuj ją przed przeniesieniem');
+	}
+	const validation = validatePersonPlacement(schedule.person_id, nextRoomId, nextSlotId, schedule.id);
+	if (!validation.valid) throw new Error(validation.reason);
+	if (updates.room_id !== undefined) schedule.room_id = updates.room_id;
+	if (updates.time_slot_id !== undefined || updates.start_time_slot_id !== undefined) {
+		schedule.time_slot_id = nextSlotId;
+	}
+	if (updates.status !== undefined) schedule.status = updates.status;
+	if (updates.locked !== undefined) schedule.locked = updates.locked === true;
+	if (updates.notes !== undefined) schedule.notes = updates.notes;
+	schedule.updated_at = now();
+	if (person) recordUndo(person.convention_id, 'Zmiana grafiku osoby', snapshot);
+	persist();
+	return getPeopleScheduleById(id);
+}
+
+export function deletePeopleSchedule(id) {
+	ensureLoaded();
+	const schedule = state.people_schedules.find((s) => s.id === id);
+	const person = schedule ? state.people.find((p) => p.id === schedule.person_id) : null;
+	const snapshot = person ? snapshotScheduleState(person.convention_id) : null;
+	state.people_schedules = state.people_schedules.filter((s) => s.id !== id);
+	if (person) recordUndo(person.convention_id, 'Usunięcie osoby z grafiku', snapshot);
+	persist();
 }
 
 function getSlotBlock(conventionId, startSlotId, slotCount) {
@@ -1456,43 +2329,41 @@ function hostsConflict(hostIds, slotIds, excludeEventId = null) {
 	return false;
 }
 
+function eventTagConflict(event, slotIds, excludeScheduleId = null) {
+	for (const sched of state.schedules) {
+		if (sched.id === excludeScheduleId || sched.event_id === event.id) continue;
+		const otherEvent = state.events.find((e) => e.id === sched.event_id);
+		if (!otherEvent || !haveSharedTags(event.conflict_tags, otherEvent.conflict_tags)) continue;
+		const block = getSlotBlock(otherEvent.convention_id, sched.start_time_slot_id, sched.slot_count);
+		if (block.some((slot) => slotIds.includes(slot.id))) {
+			return otherEvent;
+		}
+	}
+	return null;
+}
+
+function eventCoScheduleWarning(event, slotIds, excludeScheduleId = null) {
+	if (!normalizeTags(event.co_schedule_tags).length) return null;
+	for (const sched of state.schedules) {
+		if (sched.id === excludeScheduleId || sched.event_id === event.id) continue;
+		const otherEvent = state.events.find((e) => e.id === sched.event_id);
+		if (!otherEvent || !haveSharedTags(event.co_schedule_tags, otherEvent.co_schedule_tags)) continue;
+		const block = getSlotBlock(otherEvent.convention_id, sched.start_time_slot_id, sched.slot_count);
+		if (!block.some((slot) => slotIds.includes(slot.id))) {
+			return `Tag wspólnego slotu nie jest razem z „${otherEvent.title}"`;
+		}
+	}
+	return null;
+}
+
 function getDaySlots(conventionId, date) {
 	return state.time_slots
 		.filter((ts) => ts.convention_id === conventionId && ts.date === date && ts.is_active === 1)
 		.sort((a, b) => a.start_time.localeCompare(b.start_time));
 }
 
-function countHostSchedulingWarnings(entries) {
-	if (!entries.length) return 0;
-
-	const sorted = [...entries].sort((a, b) => a.startIdx - b.startIdx);
-	let warnings = 0;
-
-	for (let i = 1; i < sorted.length; i++) {
-		const prev = sorted[i - 1];
-		const curr = sorted[i];
-		const prevEnd = prev.startIdx + prev.slotCount;
-		if (curr.startIdx === prevEnd && prev.roomId !== curr.roomId) {
-			warnings++;
-		}
-	}
-
-	let consecutive = sorted[0].slotCount;
-	for (let i = 1; i < sorted.length; i++) {
-		const prev = sorted[i - 1];
-		const curr = sorted[i];
-		const prevEnd = prev.startIdx + prev.slotCount;
-		if (curr.startIdx === prevEnd) {
-			consecutive += curr.slotCount;
-			continue;
-		}
-
-		if (consecutive >= 6) warnings++;
-		consecutive = curr.slotCount;
-	}
-	if (consecutive >= 6) warnings++;
-
-	return warnings;
+function countHostSchedulingWarnings() {
+	return 0;
 }
 
 function countRoomCompactnessPenalty(entries) {
@@ -1531,6 +2402,8 @@ const AUTO_SOLVER_CAPACITY_WEIGHT = 10_000;
 const AUTO_SOLVER_TIER1_SLOT_WEIGHT = 50_000;
 const AUTO_SOLVER_TIER_DISTANCE_WEIGHT = 1_000;
 const AUTO_SOLVER_ROOM_GAP_WEIGHT = 5_000;
+const AUTO_SOLVER_CLUSTER_WEIGHT = 2_500;
+const AUTO_SOLVER_CO_SCHEDULE_WEIGHT = 750;
 const AUTO_SOLVER_START_WEIGHT = 10;
 const AUTO_SOLVER_FUTURE_EVAL_LIMIT = 20_000;
 const AUTO_SOLVER_FULL_SEARCH_ITEM_LIMIT = 120;
@@ -2071,6 +2944,8 @@ function getSolverFixedSchedules(conventionId, autoEventIds) {
 function addSolverOccupancyForPlacement(occupancy, placement) {
 	for (const key of placement.roomKeys) occupancy.room.add(key);
 	for (const key of placement.hostKeys) occupancy.host.add(key);
+	for (const key of placement.tagKeys || []) occupancy.tags.add(key);
+	for (const key of placement.coTagKeys || []) occupancy.coTags.add(key);
 	for (const entry of placement.hostDateEntries) {
 		const key = `${entry.hostId}|${entry.date}`;
 		if (!occupancy.hostDates.has(key)) occupancy.hostDates.set(key, []);
@@ -2086,6 +2961,8 @@ function addSolverOccupancyForPlacement(occupancy, placement) {
 function removeSolverOccupancyForPlacement(occupancy, placement) {
 	for (const key of placement.roomKeys) occupancy.room.delete(key);
 	for (const key of placement.hostKeys) occupancy.host.delete(key);
+	for (const key of placement.tagKeys || []) occupancy.tags.delete(key);
+	for (const key of placement.coTagKeys || []) occupancy.coTags.delete(key);
 	for (const entry of placement.hostDateEntries) {
 		const key = `${entry.hostId}|${entry.date}`;
 		const entries = occupancy.hostDates.get(key) || [];
@@ -2105,8 +2982,29 @@ function removeSolverOccupancyForPlacement(occupancy, placement) {
 function solverPlacementConflicts(occupancy, placement) {
 	return (
 		placement.roomKeys.some((key) => occupancy.room.has(key)) ||
-		placement.hostKeys.some((key) => occupancy.host.has(key))
+		placement.hostKeys.some((key) => occupancy.host.has(key)) ||
+		(placement.tagKeys || []).some((key) => occupancy.tags.has(key))
 	);
+}
+
+function solverCoScheduleBonus(occupancy, placement) {
+	return (placement.coTagKeys || []).filter((key) => occupancy.coTags.has(key)).length;
+}
+
+function solverClusterDelta(occupancy, placement) {
+	let delta = 0;
+	const settings = normalizeEventModeSettings(getConvention(placement.conventionId)?.mode_settings);
+	const limit = normalizeClusterLimit(settings.cluster_same_person_limit);
+	if (limit === '0') return 0;
+	const max = limit === 'MAX' ? Number.POSITIVE_INFINITY : Number(limit);
+	for (const entry of placement.hostDateEntries) {
+		const key = `${entry.hostId}|${entry.date}`;
+		const current = occupancy.hostDates.get(key) || [];
+		const clustered = current.filter((other) => Math.abs(other.startIdx - entry.startIdx) <= 1).length;
+		if (Number.isFinite(max) && clustered >= max) delta += clustered - max + 1;
+		else delta -= clustered;
+	}
+	return delta;
 }
 
 function solverWarningDelta(occupancy, placement) {
@@ -2139,6 +3037,8 @@ function solverPlacementScore(occupancy, placement) {
 		placement.capacitySlack * AUTO_SOLVER_CAPACITY_WEIGHT +
 		placement.tierDistance * AUTO_SOLVER_TIER_DISTANCE_WEIGHT +
 		solverRoomGapDelta(occupancy, placement) * AUTO_SOLVER_ROOM_GAP_WEIGHT +
+		solverClusterDelta(occupancy, placement) * AUTO_SOLVER_CLUSTER_WEIGHT -
+		solverCoScheduleBonus(occupancy, placement) * AUTO_SOLVER_CO_SCHEDULE_WEIGHT +
 		placement.startOrder * AUTO_SOLVER_START_WEIGHT +
 		placement.roomOrder
 	);
@@ -2201,6 +3101,8 @@ function buildSolverInitialOccupancy(conventionId, autoEventIds) {
 	const occupancy = {
 		room: new Set(),
 		host: new Set(),
+		tags: new Set(),
+		coTags: new Set(),
 		hostDates: new Map(),
 		roomDates: new Map()
 	};
@@ -2213,8 +3115,15 @@ function buildSolverInitialOccupancy(conventionId, autoEventIds) {
 		const date = block[0]?.date;
 		const startIdx = getDaySlots(conventionId, date).findIndex((slot) => slot.id === block[0]?.id);
 		addSolverOccupancyForPlacement(occupancy, {
+			conventionId,
 			roomKeys: block.map((slot) => `${schedule.room_id}|${slot.id}`),
 			hostKeys: hostIds.flatMap((hostId) => block.map((slot) => `${hostId}|${slot.id}`)),
+			tagKeys: normalizeTags(event.conflict_tags).flatMap((tag) =>
+				block.map((slot) => `${tag.toLowerCase()}|${slot.id}`)
+			),
+			coTagKeys: normalizeTags(event.co_schedule_tags).flatMap((tag) =>
+				block.map((slot) => `${tag.toLowerCase()}|${slot.id}`)
+			),
 			hostDateEntries: hostIds
 				.map((hostId) => ({
 					hostId,
@@ -2260,6 +3169,7 @@ function buildSolverPlacementsForItem(item, rooms, daySlotsByDate, occupancy) {
 				const slotTier = getBlockPopularityTier(slotIds);
 				const placement = {
 					item,
+					conventionId: item.conventionId,
 					room_id: room.id,
 					start_time_slot_id: block[0].id,
 					slot_count: item.slotCount,
@@ -2270,6 +3180,12 @@ function buildSolverPlacementsForItem(item, rooms, daySlotsByDate, occupancy) {
 					roomOrder,
 					roomKeys: block.map((slot) => `${room.id}|${slot.id}`),
 					hostKeys: item.hostIds.flatMap((hostId) => block.map((slot) => `${hostId}|${slot.id}`)),
+					tagKeys: normalizeTags(item.event?.conflict_tags).flatMap((tag) =>
+						block.map((slot) => `${tag.toLowerCase()}|${slot.id}`)
+					),
+					coTagKeys: normalizeTags(item.event?.co_schedule_tags).flatMap((tag) =>
+						block.map((slot) => `${tag.toLowerCase()}|${slot.id}`)
+					),
 					hostDateEntries: item.hostIds.map((hostId) => ({
 						hostId,
 						date,
@@ -2311,6 +3227,8 @@ function cloneSolverOccupancy(occupancy) {
 	return {
 		room: new Set(occupancy.room),
 		host: new Set(occupancy.host),
+		tags: new Set(occupancy.tags),
+		coTags: new Set(occupancy.coTags),
 		hostDates: new Map([...occupancy.hostDates].map(([key, entries]) => [key, [...entries]])),
 		roomDates: new Map([...occupancy.roomDates].map(([key, entries]) => [key, [...entries]]))
 	};
@@ -2794,11 +3712,18 @@ export function getPersonHours(conventionId) {
 			.filter((eh) => eh.person_id === person.id)
 			.map((eh) => eh.event_id);
 		const personSchedules = state.schedules.filter((s) => hostedEventIds.includes(s.event_id));
-		const totalSlots = personSchedules.reduce((sum, s) => sum + s.slot_count, 0);
+		const peopleSchedules = state.people_schedules.filter((s) => s.person_id === person.id);
+		const totalSlots =
+			personSchedules.reduce((sum, s) => sum + s.slot_count, 0) + peopleSchedules.length;
 		return {
 			id: person.id,
 			display_name: person.display_name,
-			schedule_count: personSchedules.length,
+			min_blocks: person.min_blocks,
+			max_blocks: person.max_blocks,
+			color: normalizeNullableColor(person.color),
+			conflict_tags: normalizeTags(person.conflict_tags),
+			co_schedule_tags: normalizeTags(person.co_schedule_tags),
+			schedule_count: personSchedules.length + peopleSchedules.length,
 			total_slots: totalSlots,
 			total_hours: (totalSlots * slotMinutes) / 60
 		};
@@ -2818,13 +3743,89 @@ export async function autoScheduleEvent(eventId, onProgress = null, progress = {
 	return applyAutoSchedulePlan(plan);
 }
 
+async function autoSchedulePeople(conventionId, onProgress = null) {
+	const people = getPeople(conventionId);
+	const rooms = getRooms(conventionId);
+	const slots = getTimeSlots(conventionId);
+	const availability = getAvailability(conventionId);
+	const existingSchedules = getPeopleSchedules(conventionId);
+	const snapshot = snapshotScheduleState(conventionId);
+
+	if (onProgress) {
+		await onProgress({
+			current: 0,
+			total: people.length,
+			phase: 'Budowanie zbalansowanego grafiku osób...'
+		});
+		await yieldToBrowser();
+	}
+
+	const locked = state.people_schedules.filter((schedule) => {
+		const person = state.people.find((p) => p.id === schedule.person_id);
+		return person?.convention_id === conventionId && schedule.locked === true;
+	});
+	state.people_schedules = state.people_schedules.filter((schedule) => {
+		const person = state.people.find((p) => p.id === schedule.person_id);
+		return person?.convention_id !== conventionId || schedule.locked === true;
+	});
+
+	const plan = buildPeopleAutoSchedulePlan({
+		people,
+		rooms,
+		slots,
+		availability,
+		existingSchedules: locked.map(mapPeopleScheduleRow),
+		settings: getConvention(conventionId)?.mode_settings ?? {}
+	});
+
+	const timestamp = now();
+	let applied = 0;
+	for (const placement of plan) {
+		state.people_schedules.push({
+			id: crypto.randomUUID(),
+			person_id: placement.person_id,
+			room_id: placement.room_id,
+			time_slot_id: placement.time_slot_id,
+			status: 'scheduled',
+			locked: false,
+			notes: null,
+			created_at: timestamp,
+			updated_at: timestamp
+		});
+		applied++;
+		if (onProgress && applied % 10 === 0) {
+			await onProgress({
+				current: Math.min(applied, people.length),
+				total: people.length,
+				phase: `Zapisywanie grafiku osób (${applied})...`
+			});
+			await yieldToBrowser();
+		}
+	}
+
+	recordUndo(conventionId, 'Autoplanowanie osób', snapshot);
+	persist();
+	const scheduled = getPeopleSchedules(conventionId);
+	return {
+		successes: scheduled,
+		errors: [],
+		totalProcessed: people.length,
+		restored: false
+	};
+}
+
 export async function autoScheduleAll(conventionId, onProgress = null) {
 	ensureLoaded();
+	const convention = getConvention(conventionId);
+	if (normalizeScheduleMode(convention?.schedule_mode) === SCHEDULE_MODES.PEOPLE) {
+		return autoSchedulePeople(conventionId, onProgress);
+	}
 	const autoEvents = state.events.filter(
 		(event) => event.convention_id === conventionId && event.auto_schedule !== 0
 	);
 	const eventIds = new Set(autoEvents.map((e) => e.id));
 	const originalState = JSON.parse(JSON.stringify(state));
+	const undoSnapshot = snapshotScheduleState(conventionId);
 	const originalScheduledCount = state.schedules.filter((schedule) =>
 		eventIds.has(schedule.event_id)
 	).length;
@@ -2907,13 +3908,15 @@ export async function autoScheduleAll(conventionId, onProgress = null) {
 			successes: [],
 			errors: autoEvents.map((event) => ({
 				event,
-				error: 'Przebudowa grafiku nie poprawiła liczby zaplanowanych atrakcji'
+				error: 'Autoplanowanie nie poprawiło liczby zaplanowanych atrakcji'
 			})),
 			totalProcessed: autoEvents.length,
 			restored: true
 		};
 	}
 
+	recordUndo(conventionId, 'Autoplanowanie atrakcji', undoSnapshot);
+	persist();
 	return { successes, errors, totalProcessed: autoEvents.length, restored: false };
 }
 
@@ -2940,7 +3943,25 @@ export function validateEventPlacement(eventId, roomId, startTimeSlotId, exclude
 	const roomFit = eventRoomFit(event, room);
 
 	if (block.length < slotCount) {
-		return { valid: false, reason: 'Za mało kolejnych slotów' };
+		return { valid: false, reason: 'Brak wystarczającej liczby kolejnych terminów' };
+	}
+	let worstTier = 1;
+	let unavailableHost = null;
+	for (const hostId of hostIds) {
+		for (const slotId of slotIds) {
+			const tier = getEffectiveAvailability(hostId, slotId);
+			worstTier = Math.max(worstTier, tier);
+			if (tier === 3 && !unavailableHost) {
+				unavailableHost = event.hosts.find((host) => host.id === hostId);
+			}
+		}
+	}
+	if (unavailableHost) {
+		return {
+			valid: false,
+			reason: `${unavailableHost.display_name || 'Prowadzący'}: niedostępny w tym czasie`,
+			code: 'availability-unavailable'
+		};
 	}
 	if (roomFit.overCapacity > 0) {
 		return {
@@ -2960,17 +3981,19 @@ export function validateEventPlacement(eventId, roomId, startTimeSlotId, exclude
 	if (hostsConflict(hostIds, slotIds, event.id)) {
 		return { valid: false, reason: 'Prowadzący ma konflikt' };
 	}
-
-	let worstTier = 1;
-	for (const hostId of hostIds) {
-		for (const slotId of slotIds) {
-			worstTier = Math.max(worstTier, getEffectiveAvailability(hostId, slotId));
-		}
+	const tagConflict = eventTagConflict(event, slotIds, excludeScheduleId);
+	if (tagConflict) {
+		return {
+			valid: false,
+			reason: `Konflikt tagów z „${tagConflict.title}"`,
+			code: 'tag-conflict'
+		};
 	}
 
 	const eventTier = getEventTierForScheduling(event);
 	const slotTier = getBlockPopularityTier(slotIds);
 	const tierMismatch = Math.abs(eventTier - slotTier);
+	const coScheduleWarning = eventCoScheduleWarning(event, slotIds, excludeScheduleId);
 
 	return {
 		valid: true,
@@ -2979,7 +4002,7 @@ export function validateEventPlacement(eventId, roomId, startTimeSlotId, exclude
 		slotTier,
 		tierMismatch,
 		roomFit,
-		warning: null,
+		warning: worstTier === 2 ? 'Prowadzący woli nie w tym czasie' : coScheduleWarning,
 		info: tierMismatch > 0 ? `Tier atrakcji T${eventTier} nie pasuje do slotu T${slotTier}` : null
 	};
 }
@@ -2994,6 +4017,7 @@ export function executeImportFromPreview(preview, options) {
 	const timestamp = now();
 	const conventionId = crypto.randomUUID();
 	const slotMinutes = Number(conventionConfig.slotMinutes) || 30;
+	const scheduleMode = normalizeScheduleMode(conventionConfig.scheduleMode ?? conventionConfig.schedule_mode);
 	const dayHours = normalizeConventionDayHours(
 		conventionConfig.daySettings,
 		conventionConfig.startDate,
@@ -3012,9 +4036,12 @@ export function executeImportFromPreview(preview, options) {
 		day_start_hour: defaultHours.startHour,
 		day_end_hour: defaultHours.endHour,
 		day_hours: dayHours,
+		schedule_mode: scheduleMode,
+		mode_settings: normalizeConventionModeSettings(scheduleMode, conventionConfig.modeSettings),
 		created_at: timestamp,
 		updated_at: timestamp
 	});
+	state.active_convention_id = conventionId;
 
 	const slotCount = generateTimeSlotsInternal(
 		conventionId,
@@ -3032,8 +4059,12 @@ export function executeImportFromPreview(preview, options) {
 		.filter((ts) => ts.convention_id === conventionId)
 		.map((ts) => ts.id);
 
-	for (const roomName of roomNames) {
-		state.rooms.push(roomRecord(conventionId, roomName, timestamp));
+	for (const [index, roomName] of roomNames.entries()) {
+		const capabilities =
+			scheduleMode === SCHEDULE_MODES.PEOPLE
+				? capabilitiesWithRoomNameTag(roomName, roomCapabilitiesForName(roomName))
+				: roomCapabilitiesForName(roomName);
+		state.rooms.push(roomRecord(conventionId, roomName, timestamp, capabilities, index));
 	}
 
 	for (const [sourceValue, ranges] of Object.entries(valueMappings)) {
@@ -3086,6 +4117,9 @@ export function executeImportFromPreview(preview, options) {
 				estimated_attendance: normalizeNullableInteger(event.estimated_attendance),
 				required_room_tags: normalizeList(event.required_room_tags),
 				equipment_needs: normalizeList(event.equipment_needs),
+				color: normalizeNullableColor(event.color),
+				conflict_tags: normalizeTags(event.conflict_tags),
+				co_schedule_tags: normalizeTags(event.co_schedule_tags),
 				source_row_hash: event.source_row_hash,
 				created_at: timestamp,
 				updated_at: timestamp
@@ -3165,6 +4199,7 @@ export function createManualConvention(options) {
 	const timestamp = now();
 	const conventionId = crypto.randomUUID();
 	const slotMinutes = Number(conventionConfig.slotMinutes) || 30;
+	const scheduleMode = normalizeScheduleMode(conventionConfig.scheduleMode ?? conventionConfig.schedule_mode);
 	const dayHours = normalizeConventionDayHours(
 		conventionConfig.daySettings,
 		conventionConfig.startDate,
@@ -3183,9 +4218,12 @@ export function createManualConvention(options) {
 		day_start_hour: defaultHours.startHour,
 		day_end_hour: defaultHours.endHour,
 		day_hours: dayHours,
+		schedule_mode: scheduleMode,
+		mode_settings: normalizeConventionModeSettings(scheduleMode, conventionConfig.modeSettings),
 		created_at: timestamp,
 		updated_at: timestamp
 	});
+	state.active_convention_id = conventionId;
 
 	const slotCount = generateTimeSlotsInternal(
 		conventionId,
@@ -3200,8 +4238,12 @@ export function createManualConvention(options) {
 
 	const conventionSlots = state.time_slots.filter((ts) => ts.convention_id === conventionId);
 
-	for (const roomName of roomNames) {
-		state.rooms.push(roomRecord(conventionId, roomName, timestamp));
+	for (const [index, roomName] of roomNames.entries()) {
+		const capabilities =
+			scheduleMode === SCHEDULE_MODES.PEOPLE
+				? capabilitiesWithRoomNameTag(roomName, roomCapabilitiesForName(roomName))
+				: roomCapabilitiesForName(roomName);
+		state.rooms.push(roomRecord(conventionId, roomName, timestamp, capabilities, index));
 	}
 
 	let peopleCount = 0;
@@ -3220,13 +4262,33 @@ export function createManualConvention(options) {
 			display_name: displayName,
 			phone: entry.phone?.trim() || null,
 			notes: entry.notes?.trim() || null,
+			min_blocks: normalizePersonFields(entry).min_blocks,
+			max_blocks: normalizePersonFields(entry).max_blocks,
+			color: normalizeNullableColor(entry.color),
+			conflict_tags: normalizePersonFields(entry).conflict_tags,
+			co_schedule_tags: normalizePersonFields(entry).co_schedule_tags,
+			tag_preferences: normalizePersonFields(entry).tag_preferences,
 			created_at: timestamp,
 			updated_at: timestamp
 		});
 
-		for (const slot of conventionSlots) {
-			upsertAvailability(personId, slot.id, 1, timestamp);
+		if (Array.isArray(entry.availability_ranges) && entry.availability_ranges.length > 0) {
+			for (const slot of conventionSlots) {
+				const matched = entry.availability_ranges.find(
+					(range) =>
+						range.date === slot.date &&
+						slot.start_time >= range.start &&
+						slot.start_time < range.end
+				);
+				setAvailabilityExactInternal(personId, slot.id, matched?.tier ?? 3, timestamp);
+			}
+		} else {
+			for (const slot of conventionSlots) {
+				upsertAvailability(personId, slot.id, 1, timestamp);
+			}
 		}
+
+		if (scheduleMode === SCHEDULE_MODES.PEOPLE) continue;
 
 		for (const event of entry.events || []) {
 			const title = event.title?.trim();
@@ -3254,6 +4316,9 @@ export function createManualConvention(options) {
 				estimated_attendance: normalizeNullableInteger(event.estimated_attendance),
 				required_room_tags: normalizeList(event.required_room_tags),
 				equipment_needs: normalizeList(event.equipment_needs),
+				color: normalizeNullableColor(event.color),
+				conflict_tags: normalizeTags(event.conflict_tags),
+				co_schedule_tags: normalizeTags(event.co_schedule_tags),
 				source_row_hash: null,
 				created_at: timestamp,
 				updated_at: timestamp
@@ -3266,7 +4331,7 @@ export function createManualConvention(options) {
 	if (peopleCount === 0) {
 		throw new Error('Dodaj co najmniej jedną osobę z pseudonimem');
 	}
-	if (eventCount === 0) {
+	if (scheduleMode !== SCHEDULE_MODES.PEOPLE && eventCount === 0) {
 		throw new Error('Dodaj co najmniej jedną atrakcję');
 	}
 
@@ -3279,6 +4344,310 @@ export function createManualConvention(options) {
 		slotCount,
 		availabilityCount: peopleCount * conventionSlots.length
 	};
+}
+
+export function getUndoHistory(conventionId) {
+	ensureLoaded();
+	return state.undo_history
+		.filter((entry) => entry.convention_id === conventionId)
+		.sort((a, b) => b.created_at.localeCompare(a.created_at))
+		.map(({ snapshot, ...entry }) => entry);
+}
+
+export function undoLastActions(conventionId, count = 1) {
+	ensureLoaded();
+	const amount = Math.max(1, Math.floor(Number(count) || 1));
+	const conventionHistory = state.undo_history
+		.filter((entry) => entry.convention_id === conventionId)
+		.sort((a, b) => b.created_at.localeCompare(a.created_at));
+	const selected = conventionHistory.slice(0, amount);
+	if (selected.length === 0) return { undone: 0 };
+	const target = selected[selected.length - 1];
+	restoreConventionSnapshot(conventionId, target.snapshot);
+	const selectedIds = new Set(selected.map((entry) => entry.id));
+	state.undo_history = state.undo_history.filter((entry) => !selectedIds.has(entry.id));
+	persist();
+	return { undone: selected.length };
+}
+
+function csvEscape(value) {
+	const text = String(value ?? '');
+	if (/[",\n;]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+	return text;
+}
+
+function rowsToCsv(rows) {
+	return rows.map((row) => row.map(csvEscape).join(',')).join('\n');
+}
+
+export function exportDataJson() {
+	ensureLoaded();
+	return JSON.stringify(
+		{
+			version: 1,
+			exported_at: now(),
+			state
+		},
+		null,
+		2
+	);
+}
+
+function convertEventConventionsToPeopleMode(conventionIds = null) {
+	for (const convention of state.conventions) {
+		if (conventionIds && !conventionIds.has(convention.id)) continue;
+		if (normalizeScheduleMode(convention.schedule_mode) !== SCHEDULE_MODES.EVENTS) continue;
+
+		const eventIds = new Set(
+			state.events.filter((event) => event.convention_id === convention.id).map((event) => event.id)
+		);
+
+		// Carry every scheduled event over into the people grid: each event's host(s)
+		// occupy that event's room for every slot the event spanned. This keeps "who
+		// is where, when" intact instead of dropping all placements on conversion.
+		const timestamp = now();
+		const seen = new Set();
+		for (const schedule of state.schedules) {
+			if (!eventIds.has(schedule.event_id)) continue;
+			const block = getSlotBlock(convention.id, schedule.start_time_slot_id, schedule.slot_count || 1);
+			const slots = block.length ? block : state.time_slots.filter((ts) => ts.id === schedule.start_time_slot_id);
+			for (const hostId of getEventHostIds(schedule.event_id)) {
+				for (const slot of slots) {
+					const key = `${hostId}|${schedule.room_id}|${slot.id}`;
+					if (seen.has(key)) continue;
+					seen.add(key);
+					state.people_schedules.push({
+						id: crypto.randomUUID(),
+						person_id: hostId,
+						room_id: schedule.room_id,
+						time_slot_id: slot.id,
+						status: schedule.status || 'scheduled',
+						locked: schedule.locked === true,
+						notes: schedule.notes || null,
+						created_at: timestamp,
+						updated_at: timestamp
+					});
+				}
+			}
+		}
+
+		convention.schedule_mode = SCHEDULE_MODES.PEOPLE;
+		convention.mode_settings = normalizePeopleModeSettings(convention.mode_settings);
+		state.schedules = state.schedules.filter((schedule) => !eventIds.has(schedule.event_id));
+		state.event_hosts = state.event_hosts.filter((host) => !eventIds.has(host.event_id));
+		state.events = state.events.filter((event) => event.convention_id !== convention.id);
+		for (const room of state.rooms.filter((entry) => entry.convention_id === convention.id)) {
+			room.capabilities = serializeRoomCapabilities(
+				capabilitiesWithRoomNameTag(room.name, room.capabilities)
+			);
+		}
+	}
+}
+
+// Appends an imported dataset as fresh, fully isolated profile(s): every id is
+// remapped to a new UUID so the import can never collide with — or mutate — the
+// profiles already in the store. Returns the new active convention id.
+function mergeImportedState(importedState) {
+	const maps = {
+		convention: new Map(),
+		person: new Map(),
+		room: new Map(),
+		event: new Map(),
+		slot: new Map()
+	};
+	const remap = (map, oldId) => {
+		if (oldId == null) return oldId;
+		if (!map.has(oldId)) map.set(oldId, crypto.randomUUID());
+		return map.get(oldId);
+	};
+	const list = (value) => (Array.isArray(value) ? value : []);
+
+	for (const convention of list(importedState.conventions)) {
+		state.conventions.push({ ...convention, id: remap(maps.convention, convention.id) });
+	}
+	for (const room of list(importedState.rooms)) {
+		state.rooms.push({
+			...room,
+			id: remap(maps.room, room.id),
+			convention_id: remap(maps.convention, room.convention_id)
+		});
+	}
+	for (const person of list(importedState.people)) {
+		state.people.push({
+			...person,
+			id: remap(maps.person, person.id),
+			convention_id: remap(maps.convention, person.convention_id)
+		});
+	}
+	for (const event of list(importedState.events)) {
+		state.events.push({
+			...event,
+			id: remap(maps.event, event.id),
+			convention_id: remap(maps.convention, event.convention_id)
+		});
+	}
+	for (const slot of list(importedState.time_slots)) {
+		state.time_slots.push({
+			...slot,
+			id: remap(maps.slot, slot.id),
+			convention_id: remap(maps.convention, slot.convention_id)
+		});
+	}
+	for (const host of list(importedState.event_hosts)) {
+		state.event_hosts.push({
+			event_id: remap(maps.event, host.event_id),
+			person_id: remap(maps.person, host.person_id)
+		});
+	}
+	for (const schedule of list(importedState.schedules)) {
+		state.schedules.push({
+			...schedule,
+			id: crypto.randomUUID(),
+			event_id: remap(maps.event, schedule.event_id),
+			room_id: remap(maps.room, schedule.room_id),
+			start_time_slot_id: remap(maps.slot, schedule.start_time_slot_id)
+		});
+	}
+	for (const schedule of list(importedState.people_schedules)) {
+		state.people_schedules.push({
+			...schedule,
+			id: crypto.randomUUID(),
+			person_id: remap(maps.person, schedule.person_id),
+			room_id: remap(maps.room, schedule.room_id),
+			time_slot_id: remap(maps.slot, schedule.time_slot_id)
+		});
+	}
+	for (const entry of list(importedState.availability)) {
+		state.availability.push({
+			...entry,
+			id: crypto.randomUUID(),
+			person_id: remap(maps.person, entry.person_id),
+			time_slot_id: remap(maps.slot, entry.time_slot_id)
+		});
+	}
+	for (const mapping of list(importedState.import_value_mappings)) {
+		state.import_value_mappings.push({
+			...mapping,
+			id: crypto.randomUUID(),
+			convention_id: remap(maps.convention, mapping.convention_id)
+		});
+	}
+
+	const firstConvention = list(importedState.conventions)[0];
+	return {
+		activeId: firstConvention ? maps.convention.get(firstConvention.id) : null,
+		conventionIds: new Set(maps.convention.values())
+	};
+}
+
+export function importDataJson(jsonText, options = {}) {
+	ensureLoaded();
+	let parsed;
+	try {
+		parsed = JSON.parse(jsonText);
+	} catch {
+		throw new Error('Plik nie jest poprawnym plikiem JSON.');
+	}
+	if (!parsed || typeof parsed !== 'object') {
+		throw new Error('Plik nie zawiera danych do importu.');
+	}
+
+	// Accept every shape we have ever exported:
+	//  - legacy full dump:    { version, exported_at, state: {…tables} }
+	//  - plan export:         { format: 'grafikonator-6000-plan', data: {…tables} }
+	//  - a bare state object: { conventions, people, … }
+	const importedState =
+		(parsed.state && typeof parsed.state === 'object' && parsed.state) ||
+		(parsed.data && typeof parsed.data === 'object' && parsed.data) ||
+		parsed;
+
+	if (!Array.isArray(importedState.conventions) || importedState.conventions.length === 0) {
+		throw new Error('Plik nie zawiera żadnego konwentu do zaimportowania.');
+	}
+
+	// Add the import as new isolated profile(s) instead of replacing the store, so
+	// existing profiles are preserved.
+	const { activeId, conventionIds } = mergeImportedState(importedState);
+	if (options.convertEventsToPeople) convertEventConventionsToPeopleMode(conventionIds);
+	if (activeId) state.active_convention_id = activeId;
+	migrateLoadedState();
+	persist();
+	return getConventions();
+}
+
+export function exportScheduleCsv(conventionId) {
+	ensureLoaded();
+	const convention = getConvention(conventionId);
+	if (!convention) throw new Error('Nie znaleziono konwentu');
+	const mode = normalizeScheduleMode(convention.schedule_mode);
+	if (mode === SCHEDULE_MODES.PEOPLE) {
+		const rows = [
+			[
+				'Data',
+				'Start',
+				'Koniec',
+				'Sala',
+				'Osoba',
+				'Kolor',
+				'Min. godzin',
+				'Maks. slotów',
+				'Tagi wykluczające',
+				'Tagi wspólnego slotu',
+				'Preferencje stanowisk'
+			]
+		];
+		for (const schedule of getPeopleSchedules(conventionId)) {
+			const person = schedule.person || {};
+			rows.push([
+				schedule.start_slot?.date,
+				schedule.start_slot?.start_time,
+				schedule.start_slot?.end_time,
+				schedule.room?.name,
+				person.display_name,
+				person.color,
+				person.min_blocks,
+				person.max_blocks,
+				normalizeTags(person.conflict_tags).join('; '),
+				normalizeTags(person.co_schedule_tags).join('; '),
+				Object.entries(person.tag_preferences || {})
+					.map(([tag, tier]) => `${tag}=${tier}`)
+					.join('; ')
+			]);
+		}
+		return rowsToCsv(rows);
+	}
+
+	const rows = [
+		[
+			'Data',
+			'Start',
+			'Koniec',
+			'Sala',
+			'Tytuł',
+			'Prowadzący',
+			'Czas min',
+			'Tier',
+			'Kolor',
+			'Tagi wykluczające',
+			'Tagi wspólnego slotu'
+		]
+	];
+	for (const schedule of getSchedules(conventionId)) {
+		rows.push([
+			schedule.start_slot?.date,
+			schedule.start_slot?.start_time,
+			schedule.start_slot?.end_time,
+			schedule.room?.name,
+			schedule.event?.title,
+			schedule.host_name,
+			schedule.event?.duration_minutes,
+			schedule.event?.tier,
+			schedule.event?.color,
+			normalizeTags(schedule.event?.conflict_tags).join('; '),
+			normalizeTags(schedule.event?.co_schedule_tags).join('; ')
+		]);
+	}
+	return rowsToCsv(rows);
 }
 
 export function clearAllData() {

@@ -7,6 +7,7 @@
 		getRooms,
 		createRoom,
 		updateRoom,
+		reorderRooms,
 		deleteRoom,
 		getTimeSlots,
 		updateTimeSlot,
@@ -30,6 +31,7 @@
 	let newRoomName = $state('');
 	let timeSlots = $state([]);
 	let slotBusy = $state({});
+	let draggedRoomId = $state(null);
 
 	const slotsByDate = $derived.by(() => {
 		/** @type {Map<string, any[]>} */
@@ -148,6 +150,44 @@
 		timeSlots = slotsData;
 	}
 
+	async function saveRoomOrder(nextRooms) {
+		if (!convention) return;
+		rooms = nextRooms;
+		try {
+			const ordered = await reorderRooms(
+				convention.id,
+				nextRooms.map((room) => room.id)
+			);
+			rooms = ordered;
+			toast.success('Zmieniono kolejność sal');
+		} catch (error) {
+			toast.error('Błąd kolejności sal', { description: error.message });
+			await refreshRoomsAndSlots();
+		}
+	}
+
+	function moveRoom(roomId, direction) {
+		const index = rooms.findIndex((room) => room.id === roomId);
+		const target = index + direction;
+		if (index < 0 || target < 0 || target >= rooms.length) return;
+		const next = [...rooms];
+		const [room] = next.splice(index, 1);
+		next.splice(target, 0, room);
+		saveRoomOrder(next);
+	}
+
+	function handleRoomDrop(targetRoomId) {
+		if (!draggedRoomId || draggedRoomId === targetRoomId) return;
+		const next = [...rooms];
+		const from = next.findIndex((room) => room.id === draggedRoomId);
+		const to = next.findIndex((room) => room.id === targetRoomId);
+		if (from < 0 || to < 0) return;
+		const [room] = next.splice(from, 1);
+		next.splice(to, 0, room);
+		draggedRoomId = null;
+		saveRoomOrder(next);
+	}
+
 	async function loadData() {
 		loading = true;
 		try {
@@ -159,6 +199,8 @@
 				startDate: active.start_date,
 				endDate: active.end_date,
 				slotMinutes: Number(active.slot_minutes ?? 30),
+				scheduleMode: active.schedule_mode || 'events',
+				clusterSamePersonLimit: active.mode_settings?.cluster_same_person_limit || '0',
 				daySettings: buildDaySettings(active)
 			};
 			await refreshRoomsAndSlots();
@@ -204,6 +246,11 @@
 				start_date: form.startDate,
 				end_date: form.endDate,
 				slot_minutes: Number(form.slotMinutes),
+				schedule_mode: form.scheduleMode,
+				mode_settings:
+					form.scheduleMode === 'events'
+						? { cluster_same_person_limit: form.clusterSamePersonLimit || '0' }
+						: { balance_hours: true, cluster_same_person_limit: form.clusterSamePersonLimit || '0' },
 				day_hours: (form.daySettings || []).map((day) => ({
 					date: day.date,
 					start_hour: Number(day.startHour),
@@ -235,7 +282,7 @@
 			await createRoom(convention.id, { name });
 			newRoomName = '';
 			await refreshRoomsAndSlots();
-			toast.success('Dodano salę');
+			toast.success(isPeopleMode ? 'Dodano stanowisko' : 'Dodano salę');
 		} catch (error) {
 			toast.error('Nie udało się dodać sali', { description: error.message });
 		} finally {
@@ -263,7 +310,7 @@
 				}
 			});
 			await refreshRoomsAndSlots();
-			toast.success('Zapisano salę');
+			toast.success(isPeopleMode ? 'Zapisano stanowisko' : 'Zapisano salę');
 		} catch (error) {
 			toast.error('Nie udało się zapisać sali', { description: error.message });
 		} finally {
@@ -274,12 +321,12 @@
 	}
 
 	async function handleDeleteRoom(room) {
-		if (!confirm(`Usunąć salę „${room.name}”?`)) return;
+		if (!confirm(`Usunąć ${isPeopleMode ? 'stanowisko' : 'salę'} „${room.name}”?`)) return;
 		roomBusy = { ...roomBusy, [room.id]: true };
 		try {
 			await deleteRoom(room.id);
 			await refreshRoomsAndSlots();
-			toast.success('Usunięto salę');
+			toast.success(isPeopleMode ? 'Usunięto stanowisko' : 'Usunięto salę');
 		} catch (error) {
 			toast.error('Nie udało się usunąć sali', { description: error.message });
 		} finally {
@@ -328,13 +375,17 @@
 		form.endDate;
 		syncDaySettings();
 	});
+
+	const isPeopleMode = $derived(convention?.schedule_mode === 'people');
 </script>
 
 <div class="g-page">
 	<header class="g-page-header">
-		<h1 class="g-page-title">Szczegóły konwentu</h1>
+		<h1 class="g-page-title">Ustawienia konwentu</h1>
 		<p class="g-page-subtitle">
-			Edytuj daty, godziny dnia, długość slotów, sale oraz popularność godzin (tier slotów).
+			{isPeopleMode
+				? 'Daty, godziny pracy, długość slotu i stanowiska w grafiku osób.'
+				: 'Daty, godziny pracy, długość slotu, sale i popularność poszczególnych godzin.'}
 		</p>
 	</header>
 
@@ -360,6 +411,24 @@
 						<option value={30}>30 min</option>
 						<option value={60}>60 min</option>
 					</select>
+				</div>
+				<div class="col-span-2">
+					<Label for="cluster-limit">
+						{isPeopleMode ? 'Grupuj zmiany jednej osoby' : 'Grupuj atrakcje jednej osoby'}
+					</Label>
+					<select id="cluster-limit" class="g-select" bind:value={form.clusterSamePersonLimit}>
+						<option value="0">Wyłączone</option>
+						<option value="2">Maks. 2 obok siebie</option>
+						<option value="3">Maks. 3 obok siebie</option>
+						<option value="4">Maks. 4 obok siebie</option>
+						<option value="5">Maks. 5 obok siebie</option>
+						<option value="MAX">MAX</option>
+					</select>
+					<p class="mt-1 text-xs text-muted-foreground">
+						{isPeopleMode
+							? 'Auto-grafik trzyma sloty jednej osoby pod rząd na tym samym stanowisku (ciągła zmiana).'
+							: 'Auto-grafik trzyma atrakcje tego samego prowadzącego blisko siebie tego samego dnia.'}
+					</p>
 				</div>
 				<div>
 					<Label for="start-date">Data początku</Label>
@@ -420,31 +489,50 @@
 		</Card>
 
 		<Card class="p-6 space-y-4">
-			<h2 class="text-xl font-medium text-foreground">Sale</h2>
+			<h2 class="text-xl font-medium text-foreground">{isPeopleMode ? 'Stanowiska' : 'Sale'}</h2>
 			<div class="space-y-2">
-				{#each rooms as room}
-					<div class="grid gap-3 rounded-lg border border-border p-3 md:grid-cols-[1.2fr_0.7fr_1.6fr_auto] md:items-end">
+				{#each rooms as room, index}
+					<div
+						class="grid gap-3 rounded-lg border border-border p-3 {isPeopleMode
+							? 'md:grid-cols-[auto_1fr_auto]'
+							: 'md:grid-cols-[auto_1.2fr_0.7fr_1.6fr_auto] md:items-end'}"
+						role="listitem"
+						draggable="true"
+						ondragstart={() => (draggedRoomId = room.id)}
+						ondragover={(event) => event.preventDefault()}
+						ondrop={() => handleRoomDrop(room.id)}
+					>
+						<div class="flex gap-1 md:flex-col" aria-label="Kolejność {isPeopleMode ? 'stanowiska' : 'sali'}">
+							<Button variant="outline" size="sm" onclick={() => moveRoom(room.id, -1)} disabled={index === 0}>
+								↑
+							</Button>
+							<Button variant="outline" size="sm" onclick={() => moveRoom(room.id, 1)} disabled={index === rooms.length - 1}>
+								↓
+							</Button>
+						</div>
 						<div>
-							<Label for="room-{room.id}" class="text-xs">Nazwa sali</Label>
+							<Label for="room-{room.id}" class="text-xs">{isPeopleMode ? 'Nazwa stanowiska' : 'Nazwa sali'}</Label>
 							<Input id="room-{room.id}" bind:value={roomNames[room.id]} />
 						</div>
-						<div>
-							<Label for="room-capacity-{room.id}" class="text-xs">Pojemność</Label>
-							<Input
-								id="room-capacity-{room.id}"
-								type="number"
-								min="0"
-								bind:value={roomCapabilities[room.id].capacity}
-							/>
-						</div>
-						<div>
-							<Label for="room-tags-{room.id}" class="text-xs">Tagi</Label>
-							<Input
-								id="room-tags-{room.id}"
-								bind:value={roomCapabilities[room.id].tags}
-								placeholder="projector, quiet_room"
-							/>
-						</div>
+						{#if !isPeopleMode}
+							<div>
+								<Label for="room-capacity-{room.id}" class="text-xs">Pojemność</Label>
+								<Input
+									id="room-capacity-{room.id}"
+									type="number"
+									min="0"
+									bind:value={roomCapabilities[room.id].capacity}
+								/>
+							</div>
+							<div>
+								<Label for="room-tags-{room.id}" class="text-xs">Tagi</Label>
+								<Input
+									id="room-tags-{room.id}"
+									bind:value={roomCapabilities[room.id].tags}
+									placeholder="projector, quiet_room"
+								/>
+							</div>
+						{/if}
 						<div class="flex gap-2">
 							<Button
 								variant="outline"
@@ -463,30 +551,37 @@
 								Usuń
 							</Button>
 						</div>
-						<div class="md:col-span-4">
-							<Label for="room-notes-{room.id}" class="text-xs">Uwagi</Label>
-							<Input
-								id="room-notes-{room.id}"
-								bind:value={roomCapabilities[room.id].notes}
-								placeholder="Krótki opis sali"
-							/>
-						</div>
+						{#if !isPeopleMode}
+							<div class="md:col-span-4">
+								<Label for="room-notes-{room.id}" class="text-xs">Uwagi</Label>
+								<Input
+									id="room-notes-{room.id}"
+									bind:value={roomCapabilities[room.id].notes}
+									placeholder="Krótki opis sali"
+								/>
+							</div>
+						{/if}
 					</div>
 				{/each}
 			</div>
 			<div class="flex items-end gap-2">
 				<div class="flex-1">
-					<Label for="new-room">Nowa sala</Label>
-					<Input id="new-room" bind:value={newRoomName} placeholder="np. Panelowa 2" />
+					<Label for="new-room">{isPeopleMode ? 'Nowe stanowisko' : 'Nowa sala'}</Label>
+					<Input
+						id="new-room"
+						bind:value={newRoomName}
+						placeholder={isPeopleMode ? 'np. Naganiacz' : 'np. Panelowa 2'}
+					/>
 				</div>
 				<Button onclick={handleAddRoom} disabled={!newRoomName.trim() || Boolean(roomBusy.new)}>
-					Dodaj salę
+					{isPeopleMode ? 'Dodaj stanowisko' : 'Dodaj salę'}
 				</Button>
 			</div>
 		</Card>
 
+		{#if !isPeopleMode}
 		<Card class="p-6 space-y-4">
-			<h2 class="text-xl font-medium text-foreground">Popularność godzin (tier slotów)</h2>
+			<h2 class="text-xl font-medium text-foreground">Popularność godzin</h2>
 			<p class="text-sm text-muted-foreground">
 				Tier 1 = najbardziej popularny slot, Tier 3 = najmniej popularny.
 			</p>
@@ -520,5 +615,6 @@
 				Tier atrakcji ustawisz w szczegółach atrakcji na grafiku.
 			</p>
 		</Card>
+		{/if}
 	{/if}
 </div>

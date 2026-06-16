@@ -13,11 +13,15 @@
 	import Input from '$lib/components/ui/input/input.svelte';
 	import FileInput from '$lib/components/ui/file-input/file-input.svelte';
 	import Label from '$lib/components/ui/label/label.svelte';
+	import ColorPicker from '$lib/components/ColorPicker.svelte';
 	import { toast } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
+	import { parseCsv, parseCsvRows } from '$lib/import/fieldMap.js';
 
 	const CSV_STEPS = ['Wgraj', 'Mapowanie', 'Ustawienia', 'Podgląd'];
 	const MANUAL_STEPS = ['Ustawienia', 'Osoby i atrakcje', 'Podsumowanie'];
+	const DEFAULT_MIN_BLOCKS = 1;
+	const DEFAULT_MAX_BLOCKS = 6;
 
 	let mode = $state(null);
 	let step = $state(1);
@@ -28,6 +32,7 @@
 	let fieldMappings = $state({});
 	let preview = $state(null);
 	let editablePeople = $state([]);
+	let schedulerMode = $state('events');
 	let loading = $state(false);
 	let saving = $state(false);
 
@@ -35,7 +40,8 @@
 		name: 'Demo Convention 2026',
 		startDate: '2026-09-30',
 		endDate: '2026-10-01',
-		slotMinutes: 30,
+		slotMinutes: 60,
+		clusterSamePersonLimit: '0',
 		daySettings: [],
 		slotTierSettings: []
 	});
@@ -49,6 +55,13 @@
 	let manualEntries = $state([
 		{
 			display_name: '',
+			notes: '',
+			min_blocks: DEFAULT_MIN_BLOCKS,
+			max_blocks: DEFAULT_MAX_BLOCKS,
+			color: '',
+			conflict_tags: '',
+			co_schedule_tags: '',
+			tag_preferences: '',
 			events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
 		}
 	]);
@@ -108,7 +121,7 @@
 
 	function listSlotsForDay(day) {
 		const slots = [];
-		const slotMinutes = Number(conventionConfig.slotMinutes) || 30;
+		const slotMinutes = Number(conventionConfig.slotMinutes) || 60;
 		const start = Number(day.startHour) * 60;
 		const end = Number(day.endHour) * 60;
 		for (let total = start; total < end; total += slotMinutes) {
@@ -187,6 +200,15 @@
 		return 'g-tier-2 hover:brightness-95 border-[#fbbc04]';
 	}
 
+	function submitManualStepFromKeyboard(event) {
+		if (event.key !== 'Enter' || event.target?.tagName === 'TEXTAREA') return;
+		if (mode !== 'manual' || step !== 2) return;
+		event.preventDefault();
+		if (!validateManualEntries()) return;
+		preview = manualPreview();
+		step = 3;
+	}
+
 	function formatSlotStart(timeStr) {
 		return String(timeStr || '').slice(0, 5);
 	}
@@ -203,6 +225,265 @@
 			.filter(Boolean);
 	}
 
+	function conventionConfigForSave() {
+		return {
+			...conventionConfig,
+			scheduleMode: schedulerMode,
+			modeSettings:
+				schedulerMode === 'people'
+					? { balance_hours: true, cluster_same_person_limit: conventionConfig.clusterSamePersonLimit || '0' }
+					: { cluster_same_person_limit: conventionConfig.clusterSamePersonLimit || '0' }
+		};
+	}
+
+	function findCsvValue(row, patterns) {
+		const entry = Object.entries(row).find(([header]) =>
+			patterns.some((pattern) => pattern.test(header.trim()))
+		);
+		return entry?.[1]?.trim() || '';
+	}
+
+	function normalizePreferenceValue(value) {
+		const text = String(value || '').trim().toLowerCase();
+		if (!text) return null;
+		if (['x', 'tak', 'chce', 'chcę', 'spoko', 'ok'].includes(text)) return 1;
+		if (
+			[
+				'o',
+				'obojętnie',
+				'obojetnie',
+				'jak braki',
+				'jak będą braki',
+				'jak beda braki',
+				'tylko w razie potrzeby',
+				'tylko jeśli będzie potrzeba',
+				'tylko jesli bedzie potrzeba',
+				'jeśli będzie potrzeba',
+				'jesli bedzie potrzeba'
+			].includes(text)
+		) return 2;
+		if (['-', '#', 'nie', 'nie chce', 'nie chcę', 'nie mogę', 'nie moge'].includes(text)) return 3;
+		return null;
+	}
+
+	const STATION_PREFERENCE_OPTIONS = [
+		{ value: 1, label: 'Chcę', class: 'g-tier-1 border-[#34a853]' },
+		{ value: 2, label: 'Tylko w razie potrzeby', class: 'bg-[#e8f0fe] text-[#1967d2] border-[#1a73e8]' },
+		{ value: 3, label: 'Nie chcę', class: 'g-tier-3 border-[#ea4335]' }
+	];
+
+	function parseTagPreferencesMap(value) {
+		if (!value) return {};
+		if (typeof value === 'object') return { ...value };
+		const result = {};
+		for (const part of String(value).split(/[,;\n]/)) {
+			const [rawTag, rawTier] = part.split(/[:=]/);
+			const tag = rawTag?.trim();
+			const tier = normalizePreferenceValue(rawTier);
+			if (tag && tier) result[tag] = tier;
+		}
+		return result;
+	}
+
+	function weekdayKey(value) {
+		const text = String(value || '').trim().toLowerCase();
+		if (/piątek|piatek/.test(text)) return 'piątek';
+		if (/sobota/.test(text)) return 'sobota';
+		if (/niedziela/.test(text)) return 'niedziela';
+		if (/czwartek/.test(text)) return 'czwartek';
+		return null;
+	}
+
+	function weekdayForDate(dateStr) {
+		const date = new Date(`${dateStr}T00:00:00`);
+		return date.toLocaleDateString('pl-PL', { weekday: 'long' }).toLowerCase();
+	}
+
+	function timeRangeFromCell(value) {
+		const match = String(value || '').match(/(\d{1,2})(?::\d{2})?\s*[-–]\s*(\d{1,2})(?::\d{2})?/);
+		if (!match) return null;
+		return {
+			start: `${match[1].padStart(2, '0')}:00:00`,
+			end: `${match[2].padStart(2, '0')}:00:00`
+		};
+	}
+
+	function dateForWideDay(dayLabel, dayIndex) {
+		const dates = listDates(conventionConfig.startDate, conventionConfig.endDate);
+		const key = weekdayKey(dayLabel);
+		if (key) {
+			const matched = dates.find((date) => weekdayForDate(date) === key);
+			if (matched) return matched;
+		}
+		return dates[dayIndex] || dates[0] || conventionConfig.startDate;
+	}
+
+	function wideAvailabilityEntriesFromCsv(text) {
+		const rows = parseCsvRows(text);
+		const names = (rows[0] || []).slice(2).map((name) => name.trim());
+		if (names.filter(Boolean).length < 2) return null;
+		const people = names.map((name) => ({
+			display_name: name,
+			events: [],
+			availability_ranges: []
+		}));
+		let currentDate = null;
+		let dayIndex = -1;
+		for (const row of rows.slice(1)) {
+			const dayLabel = row.find((cell) => weekdayKey(cell));
+			if (dayLabel) {
+				dayIndex++;
+				currentDate = dateForWideDay(dayLabel, dayIndex);
+				continue;
+			}
+			const range = timeRangeFromCell(row[1]);
+			if (!currentDate || !range) continue;
+			for (let idx = 0; idx < people.length; idx++) {
+				const tier = normalizePreferenceValue(row[idx + 2]) ?? 3;
+				people[idx].availability_ranges.push({
+					date: currentDate,
+					start: range.start,
+					end: range.end,
+					tier
+				});
+			}
+		}
+		return people.filter((person) => person.display_name);
+	}
+
+	function peopleEntriesFromCsv(text) {
+		const wide = wideAvailabilityEntriesFromCsv(text);
+		if (wide?.length) return wide;
+		const { rows } = parseCsv(text);
+		return rows
+			.map((row) => {
+				const displayName =
+					findCsvValue(row, [/^pseudonim$/i, /^display[_ ]?name$/i, /^osoba$/i, /^name$/i]) ||
+					Object.values(row)[0]?.trim();
+				return {
+					display_name: displayName || '',
+					notes: findCsvValue(row, [/^notat/i, /^notes$/i, /^uwagi$/i]),
+					min_blocks: findCsvValue(row, [/min/i, /minimum/i]),
+					max_blocks: findCsvValue(row, [/max/i, /maximum/i]),
+					color: findCsvValue(row, [/kolou?r/i, /^color$/i]),
+					conflict_tags: findCsvValue(row, [/conflict/i, /nie.*razem/i, /tagi konflikt/i]),
+					co_schedule_tags: findCsvValue(row, [/co.?schedule/i, /razem/i, /tagi razem/i]),
+					tag_preferences: Object.fromEntries(
+						Object.entries(row)
+							.map(([header, value]) => [header.trim(), normalizePreferenceValue(value)])
+							.filter(([header, tier]) =>
+								Boolean(
+									header &&
+										tier &&
+										!/pseudonim|display|osoba|name|min|max|kolou?r|color|conflict|razem|dyspozycyj|availability/i.test(
+											header
+										)
+								)
+							)
+					),
+					availability_notes: findCsvValue(row, [/dyspozycyj/i, /availability/i]),
+					events: []
+				};
+			})
+			.filter((entry) => entry.display_name.trim());
+	}
+
+	function tierLabelForForm(tier) {
+		if (Number(tier) === 1) return 'chcę';
+		if (Number(tier) === 2) return 'tylko w razie potrzeby';
+		return 'nie chcę';
+	}
+
+	function formatTagPreferencesForForm(value) {
+		return parseTagPreferencesMap(value);
+	}
+
+	function normalizePeopleEntryForForm(entry) {
+		return {
+			display_name: entry.display_name || '',
+			notes: entry.notes ?? '',
+			min_blocks: entry.min_blocks !== '' && entry.min_blocks != null ? entry.min_blocks : DEFAULT_MIN_BLOCKS,
+			max_blocks: entry.max_blocks !== '' && entry.max_blocks != null ? entry.max_blocks : DEFAULT_MAX_BLOCKS,
+			color: entry.color ?? '',
+			conflict_tags: entry.conflict_tags ?? '',
+			co_schedule_tags: entry.co_schedule_tags ?? '',
+			tag_preferences: formatTagPreferencesForForm(entry.tag_preferences),
+			availability_notes: entry.availability_notes ?? '',
+			availability_ranges: entry.availability_ranges ?? [],
+			events: entry.events ?? []
+		};
+	}
+
+	function updatePersonStationPreference(personIndex, stationName, tier) {
+		manualEntries = manualEntries.map((person, index) => {
+			if (index !== personIndex) return person;
+			return {
+				...person,
+				tag_preferences: {
+					...parseTagPreferencesMap(person.tag_preferences),
+					[stationName]: Number(tier)
+				}
+			};
+		});
+	}
+
+	function stationPreferenceForPerson(person, stationName) {
+		return Number(parseTagPreferencesMap(person.tag_preferences)[stationName] ?? 2);
+	}
+
+	function availabilityByDay(person) {
+		const grouped = new Map();
+		for (const range of person.availability_ranges || []) {
+			if (!grouped.has(range.date)) grouped.set(range.date, []);
+			grouped.get(range.date).push(range);
+		}
+		return [...grouped.entries()]
+			.map(([date, ranges]) => ({
+				date,
+				ranges: ranges.sort((a, b) => String(a.start).localeCompare(String(b.start)))
+			}))
+			.sort((a, b) => a.date.localeCompare(b.date));
+	}
+
+	function availabilityTierLabel(tier) {
+		const t = Number(tier);
+		if (t === 1) return 'Mogę';
+		if (t === 2) return 'Tylko w razie potrzeby';
+		return 'Nie chcę';
+	}
+
+	function availabilityRangeKey(range) {
+		return `${range.date}|${range.start}|${range.end}`;
+	}
+
+	function cyclePersonAvailabilityRange(personIndex, range) {
+		manualEntries = manualEntries.map((person, index) => {
+			if (index !== personIndex) return person;
+			const key = availabilityRangeKey(range);
+			return {
+				...person,
+				availability_ranges: (person.availability_ranges || []).map((entry) => {
+					if (availabilityRangeKey(entry) !== key) return entry;
+					const current = Number(entry.tier ?? 2);
+					return { ...entry, tier: current >= 3 ? 1 : current + 1 };
+				})
+			};
+		});
+	}
+
+	function runPeopleCsvPreview() {
+		const people = peopleEntriesFromCsv(csvText).map(normalizePeopleEntryForForm);
+		manualEntries = people.length ? people : manualEntries.map(normalizePeopleEntryForForm);
+		preview = {
+			people,
+			peopleCount: people.length,
+			eventCount: 0,
+			rooms: parsedRoomNames(),
+			warnings: []
+		};
+		editablePeople = [];
+	}
+
 	function resetFlow(nextMode) {
 		mode = nextMode;
 		step = 1;
@@ -214,9 +495,29 @@
 		manualEntries = [
 			{
 				display_name: '',
+				notes: '',
+				min_blocks: DEFAULT_MIN_BLOCKS,
+				max_blocks: DEFAULT_MAX_BLOCKS,
+				color: '',
+				conflict_tags: '',
+				co_schedule_tags: '',
+				tag_preferences: '',
+				availability_notes: '',
 				events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
 			}
 		];
+	}
+
+	function goBackOneStep() {
+		if (step > 1) {
+			step -= 1;
+			return;
+		}
+		resetFlow(null);
+	}
+
+	function backButtonLabel() {
+		return step > 1 ? '← Wróć krok' : '← Wróć do wyboru';
 	}
 
 	async function handleFileSelect(event) {
@@ -224,6 +525,15 @@
 		if (!file) return;
 		csvFileName = file.name;
 		csvText = await file.text();
+		if (schedulerMode === 'people') {
+			try {
+				runPeopleCsvPreview();
+				step = 3;
+			} catch (error) {
+				toast.error('Podgląd nieudany', { description: error.message });
+			}
+			return;
+		}
 		await runPreview();
 		step = 2;
 	}
@@ -252,13 +562,17 @@
 	}
 
 	async function handleImport() {
+		if (schedulerMode === 'people') {
+			if (!validateManualEntries()) return;
+			return handleManualSave();
+		}
 		if (!validateEditablePreview()) return;
 		saving = true;
 		try {
 			const result = await executeImport({
 				csvText,
 				fieldMappings,
-				conventionConfig,
+				conventionConfig: conventionConfigForSave(),
 				valueMappings,
 				roomNames: parsedRoomNames(),
 				editedPreview: buildEditedPreview()
@@ -278,12 +592,15 @@
 		saving = true;
 		try {
 			const result = await createManualConvention({
-				conventionConfig,
+				conventionConfig: conventionConfigForSave(),
 				roomNames: parsedRoomNames(),
 				entries: manualEntries
 			});
 			toast.success('Konwent zapisany!', {
-				description: `${result.peopleCount} osób, ${result.eventCount} atrakcji, ${result.slotCount} slotów`
+				description:
+					schedulerMode === 'people'
+						? `${result.peopleCount} osób, ${result.slotCount} slotów`
+						: `${result.peopleCount} osób, ${result.eventCount} atrakcji, ${result.slotCount} slotów`
 			});
 			goto('/schedule');
 		} catch (error) {
@@ -317,7 +634,20 @@
 	function addPerson() {
 		manualEntries = [
 			...manualEntries,
-			{ display_name: '', events: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }] }
+			{
+				display_name: '',
+				min_blocks: DEFAULT_MIN_BLOCKS,
+				max_blocks: DEFAULT_MAX_BLOCKS,
+				color: '',
+				conflict_tags: '',
+				co_schedule_tags: '',
+				tag_preferences: '',
+				availability_notes: '',
+				events:
+					schedulerMode === 'people'
+						? []
+						: [{ title: '', duration_minutes: 60, tier: 2, auto_schedule: true }]
+			}
 		];
 	}
 
@@ -398,6 +728,7 @@
 			toast.error('Dodaj co najmniej jedną osobę z pseudonimem');
 			return false;
 		}
+		if (schedulerMode === 'people') return true;
 		if (summary.eventCount === 0) {
 			toast.error('Dodaj co najmniej jedną atrakcję z tytułem i czasem trwania');
 			return false;
@@ -557,15 +888,37 @@
 	</header>
 
 	{#if mode !== null}
-		<Button variant="outline" size="sm" onclick={() => resetFlow(null)}>← Wróć do wyboru</Button>
+		<Button variant="outline" size="sm" onclick={goBackOneStep}>{backButtonLabel()}</Button>
 	{/if}
 
 	{#if mode === null}
+		<Card class="mb-4 p-6 space-y-3">
+			<h2 class="g-product-card-title">Co planujesz?</h2>
+			<p class="g-product-card-desc">
+				Wybierz, czy układasz atrakcje (panele, warsztaty…), czy obsadę osób w slotach co 30/60 min.
+			</p>
+			<div class="flex flex-wrap gap-2">
+				<Button
+					variant={schedulerMode === 'events' ? 'default' : 'outline'}
+					onclick={() => (schedulerMode = 'events')}
+				>
+					Grafik atrakcji
+				</Button>
+				<Button
+					variant={schedulerMode === 'people' ? 'default' : 'outline'}
+					onclick={() => (schedulerMode = 'people')}
+				>
+					Grafik osób
+				</Button>
+			</div>
+		</Card>
 		<div class="g-card-grid">
 			<Card class="p-6">
 				<h2 class="g-product-card-title">Import CSV</h2>
 				<p class="g-product-card-desc">
-					Eksport odpowiedzi z Google Forms — automatyczne mapowanie kolumn i dyspozycyjności.
+					{schedulerMode === 'people'
+						? 'CSV z pseudonimami, limitami godzin, tagami, kolorem i dyspozycyjnością.'
+						: 'Eksport odpowiedzi z Google Forms — automatyczne mapowanie kolumn i dyspozycyjności.'}
 				</p>
 				<Button onclick={() => resetFlow('csv')}>Kreator importu</Button>
 			</Card>
@@ -573,8 +926,9 @@
 			<Card class="p-6">
 				<h2 class="g-product-card-title">Wpis ręczny</h2>
 				<p class="g-product-card-desc">
-					Dodaj osoby, atrakcje i sale samodzielnie. Dyspozycyjność domyślnie: dostępny we
-					wszystkich slotach.
+					{schedulerMode === 'people'
+						? 'Dodaj osoby do grafiku. Każda osoba ma jeden kafelek do przeciągania — możesz ją zaplanować wielokrotnie.'
+						: 'Dodaj osoby, atrakcje i sale samodzielnie. Dyspozycyjność domyślnie: dostępny we wszystkich slotach.'}
 				</p>
 				<Button variant="outline" onclick={() => resetFlow('manual')}>Formularz ręczny</Button>
 			</Card>
@@ -687,6 +1041,25 @@
 						<Label for="end-date">Data końca</Label>
 						<Input id="end-date" type="date" bind:value={conventionConfig.endDate} />
 					</div>
+					<div class="col-span-2">
+						<Label for="cluster-limit">
+							{schedulerMode === 'people'
+								? 'Grupuj zmiany jednej osoby'
+								: 'Grupuj atrakcje jednej osoby'}
+						</Label>
+						<select
+							id="cluster-limit"
+							class="g-select"
+							bind:value={conventionConfig.clusterSamePersonLimit}
+						>
+							<option value="0">Wyłączone</option>
+							<option value="2">Maks. 2 obok siebie</option>
+							<option value="3">Maks. 3 obok siebie</option>
+							<option value="4">Maks. 4 obok siebie</option>
+							<option value="5">Maks. 5 obok siebie</option>
+							<option value="MAX">MAX</option>
+						</select>
+					</div>
 					<div class="col-span-2 space-y-2">
 						<div>
 							<p class="text-sm font-medium text-foreground">Godziny per dzień</p>
@@ -735,9 +1108,10 @@
 							{/each}
 						</div>
 					</div>
+					{#if schedulerMode === 'events'}
 					<div class="col-span-2 space-y-2">
 						<div>
-							<p class="text-sm font-medium text-foreground">Popularność godzin (hype slotów)</p>
+							<p class="text-sm font-medium text-foreground">Popularność godzin</p>
 							<p class="text-xs text-muted-foreground">
 								Ustaw tier slotów już przed importem. Kliknięcie slotu zmienia T1 → T2 → T3.
 							</p>
@@ -745,15 +1119,15 @@
 						<div class="flex flex-wrap gap-4 text-xs text-muted-foreground">
 							<span class="flex items-center gap-1">
 								<span class="g-tier-1 h-3 w-3 rounded border border-[#34a853]"></span>
-								T1 hype
+								T1 — szczyt
 							</span>
 							<span class="flex items-center gap-1">
 								<span class="g-tier-2 h-3 w-3 rounded border border-[#fbbc04]"></span>
-								T2 neutralny
+								T2 — normalnie
 							</span>
 							<span class="flex items-center gap-1">
 								<span class="g-tier-3 h-3 w-3 rounded border border-[#ea4335]"></span>
-								T3 spokojny
+								T3 — spokojnie
 							</span>
 						</div>
 						<div class="space-y-3 rounded-lg border border-border p-3">
@@ -782,6 +1156,7 @@
 							{/each}
 						</div>
 					</div>
+					{/if}
 				</div>
 				<div>
 					<Label for="rooms">Sale (jedna na linię)</Label>
@@ -799,6 +1174,11 @@
 							step = 2;
 							return;
 						}
+						if (schedulerMode === 'people') {
+							runPeopleCsvPreview();
+							step = 4;
+							return;
+						}
 						runPreview().then(() => {
 							syncEditablePeople();
 							step = 4;
@@ -806,20 +1186,29 @@
 					}}
 					disabled={loading}
 				>
-					{mode === 'manual' ? 'Dalej: osoby i atrakcje' : loading ? 'Podgląd…' : 'Dalej: podgląd'}
+					{mode === 'manual'
+						? schedulerMode === 'people'
+							? 'Dalej: osoby'
+							: 'Dalej: osoby i atrakcje'
+						: loading
+							? 'Podgląd…'
+							: 'Dalej: podgląd'}
 				</Button>
 			</Card>
 		{/if}
 
 		{#if mode === 'manual' && step === 2}
-			<Card class="p-6 space-y-4">
+			<Card class="p-6 space-y-4" onkeydown={submitManualStepFromKeyboard}>
 				<div class="flex items-center justify-between gap-3">
-					<h2 class="text-xl font-medium text-foreground">Osoby i atrakcje</h2>
+					<h2 class="text-xl font-medium text-foreground">
+						{schedulerMode === 'people' ? 'Osoby do grafiku' : 'Osoby i atrakcje'}
+					</h2>
 					<Button variant="outline" size="sm" onclick={addPerson}>+ Osoba</Button>
 				</div>
 				<p class="text-sm text-muted-foreground">
-					Każda osoba może mieć wiele atrakcji. Dyspozycyjność zostanie ustawiona na „mogę” we
-					wszystkich slotach.
+					{schedulerMode === 'people'
+						? 'Każda osoba ma jeden kafelek w panelu bocznym. Dyspozycyjność możesz doprecyzować później w zakładce Osoby.'
+						: 'Każda osoba może mieć wiele atrakcji. Dyspozycyjność zostanie ustawiona na „mogę” we wszystkich slotach.'}
 				</p>
 
 				<div class="space-y-6">
@@ -845,7 +1234,59 @@
 									</Button>
 								{/if}
 							</div>
+							<div>
+								<Label for="notes-{personIndex}">Notatki</Label>
+								<textarea
+									id="notes-{personIndex}"
+									class="g-textarea mt-1"
+									rows="2"
+									bind:value={person.notes}
+									placeholder="np. tylko spokojniejsze stanowiska, kontakt przez Discord"
+								></textarea>
+							</div>
 
+							{#if schedulerMode === 'people'}
+								<div class="grid grid-cols-1 gap-3 md:grid-cols-5">
+									<div>
+										<Label for="min-{personIndex}">Min. godzin</Label>
+										<Input id="min-{personIndex}" type="number" min="0" bind:value={person.min_blocks} />
+									</div>
+									<div>
+										<Label for="max-{personIndex}">Maks. slotów</Label>
+										<Input id="max-{personIndex}" type="number" min="0" bind:value={person.max_blocks} />
+									</div>
+									<div>
+										<Label for="color-{personIndex}">Kolor</Label>
+										<ColorPicker id="color-{personIndex}" bind:value={person.color} />
+									</div>
+									<div>
+										<Label for="conflict-{personIndex}">Tagi wykluczające</Label>
+										<Input id="conflict-{personIndex}" bind:value={person.conflict_tags} placeholder="" />
+									</div>
+									<div>
+										<Label for="together-{personIndex}">Tagi wspólnego slotu</Label>
+										<Input id="together-{personIndex}" bind:value={person.co_schedule_tags} placeholder="" />
+									</div>
+									<div class="md:col-span-5">
+										<Label for="tag-prefs-{personIndex}">Preferencje stanowisk</Label>
+										<textarea
+											id="tag-prefs-{personIndex}"
+											class="g-textarea"
+											rows="3"
+											bind:value={person.tag_preferences}
+											placeholder="Naganiacz=chcę&#10;Tierlista=tylko w razie potrzeby&#10;Rysunki=nie chcę"
+										></textarea>
+									</div>
+									<div class="md:col-span-5">
+										<Label for="availability-{personIndex}">Dyspozycyjność / notatka</Label>
+										<Input
+											id="availability-{personIndex}"
+											bind:value={person.availability_notes}
+											placeholder="np. sobota 15-18 tak, niedziela rano nie"
+										/>
+									</div>
+								</div>
+							{:else}
 							<div class="space-y-3">
 								{#each person.events as event, eventIndex}
 									<div class="grid grid-cols-1 gap-3 items-end rounded bg-white p-3 md:grid-cols-5">
@@ -906,6 +1347,7 @@
 							<Button variant="outline" size="sm" onclick={() => addEvent(personIndex)}>
 								+ Atrakcja
 							</Button>
+							{/if}
 						</div>
 					{/each}
 				</div>
@@ -924,7 +1366,163 @@
 			</Card>
 		{/if}
 
-		{#if mode === 'csv' && step === 4 && preview}
+		{#if mode === 'csv' && step === 4 && preview && schedulerMode === 'people'}
+			<Card class="p-6 space-y-4">
+				<h2 class="text-xl font-medium text-foreground">Podgląd osób</h2>
+				<p class="text-sm text-muted-foreground">
+					Sprawdź i uzupełnij dane przed zapisem. Każda osoba ma jeden kafelek w panelu bocznym —
+					możesz ją zaplanować wielokrotnie.
+				</p>
+				<div class="space-y-6">
+					{#each manualEntries as person, personIndex}
+						<div class="g-surface space-y-4 rounded-lg border border-border p-4">
+							<div class="flex items-start gap-3">
+								<div class="flex-1">
+									<Label for="preview-person-{personIndex}">Pseudonim</Label>
+									<Input
+										id="preview-person-{personIndex}"
+										bind:value={person.display_name}
+										placeholder="np. Kitsu"
+									/>
+								</div>
+								{#if manualEntries.length > 1}
+									<Button
+										variant="destructive"
+										size="sm"
+										class="mt-6"
+										onclick={() => removePerson(personIndex)}
+									>
+										Usuń osobę
+									</Button>
+								{/if}
+							</div>
+							<div>
+								<Label for="preview-notes-{personIndex}">Notatki</Label>
+								<textarea
+									id="preview-notes-{personIndex}"
+									class="g-textarea mt-1"
+									rows="2"
+									bind:value={person.notes}
+									placeholder="np. tylko spokojniejsze stanowiska, kontakt przez Discord"
+								></textarea>
+							</div>
+
+							<div class="grid grid-cols-1 gap-3 md:grid-cols-5">
+								<div>
+									<Label for="preview-min-{personIndex}">Min. godzin</Label>
+									<Input
+										id="preview-min-{personIndex}"
+										type="number"
+										min="0"
+										bind:value={person.min_blocks}
+									/>
+								</div>
+								<div>
+									<Label for="preview-max-{personIndex}">Maks. slotów</Label>
+									<Input
+										id="preview-max-{personIndex}"
+										type="number"
+										min="0"
+										bind:value={person.max_blocks}
+									/>
+								</div>
+								<div>
+									<Label for="preview-color-{personIndex}">Kolor</Label>
+									<ColorPicker id="preview-color-{personIndex}" bind:value={person.color} />
+								</div>
+								<div>
+									<Label for="preview-conflict-{personIndex}">Tagi wykluczające</Label>
+									<Input
+										id="preview-conflict-{personIndex}"
+										bind:value={person.conflict_tags}
+										placeholder=""
+									/>
+								</div>
+								<div>
+									<Label for="preview-together-{personIndex}">Tagi wspólnego slotu</Label>
+									<Input
+										id="preview-together-{personIndex}"
+										bind:value={person.co_schedule_tags}
+										placeholder=""
+									/>
+								</div>
+								<div class="md:col-span-5">
+									<Label>Preferencje stanowisk</Label>
+									<div class="mt-2 grid gap-2 md:grid-cols-2">
+										{#each parsedRoomNames() as stationName}
+											<label class="rounded border border-border bg-white p-2 text-sm">
+												<span class="mb-1 block font-medium text-foreground">{stationName}</span>
+												<select
+													class="g-select"
+													value={stationPreferenceForPerson(person, stationName)}
+													onchange={(event) =>
+														updatePersonStationPreference(
+															personIndex,
+															stationName,
+															event.currentTarget.value
+														)}
+												>
+													{#each STATION_PREFERENCE_OPTIONS as option}
+														<option value={option.value}>{option.label}</option>
+													{/each}
+												</select>
+											</label>
+										{:else}
+											<p class="text-sm text-muted-foreground">
+												Dodaj stanowiska powyżej, żeby przypisać preferencje.
+											</p>
+										{/each}
+									</div>
+								</div>
+								<div class="md:col-span-5">
+									<Label>Dyspozycyjność z CSV</Label>
+									{#if person.availability_ranges?.length}
+										<p class="mt-1 text-xs text-muted-foreground">
+											Kliknij slot, aby zmienić: zielony → żółty → czerwony.
+										</p>
+										<div class="mt-2 space-y-3 rounded border border-border bg-white p-3">
+											{#each availabilityByDay(person) as day}
+												<div>
+													<div class="mb-1 text-xs font-medium capitalize text-muted-foreground">
+														{formatDaySettingDate(day.date)}
+													</div>
+													<div class="flex flex-wrap gap-1">
+														{#each day.ranges as range}
+															<button
+																type="button"
+																class="rounded border px-2 py-1 text-xs tabular-nums transition hover:opacity-80 {getSlotTierClass(
+																	range.tier
+																)}"
+																title="{availabilityTierLabel(range.tier)} — kliknij, aby zmienić"
+																onclick={() => cyclePersonAvailabilityRange(personIndex, range)}
+															>
+																{formatSlotStart(range.start)}–{formatSlotStart(range.end)}
+															</button>
+														{/each}
+													</div>
+												</div>
+											{/each}
+										</div>
+									{:else}
+										<p class="mt-2 rounded border border-border bg-white p-3 text-sm text-muted-foreground">
+											Brak dyspozycyjności rozpoznanej z CSV dla tej osoby.
+										</p>
+									{/if}
+								</div>
+							</div>
+						</div>
+					{/each}
+				</div>
+				<div class="flex gap-3">
+					<Button variant="outline" onclick={() => (step = 3)}>Wstecz</Button>
+					<Button onclick={handleImport} disabled={saving}>
+						{saving ? 'Zapisywanie…' : 'Zapisz grafik osób'}
+					</Button>
+				</div>
+			</Card>
+		{/if}
+
+		{#if mode === 'csv' && step === 4 && preview && schedulerMode === 'events'}
 			{@const stats = editableStats()}
 			<Card class="p-6 space-y-4">
 				<h2 class="text-xl font-medium text-foreground">Podgląd i import</h2>
@@ -1088,7 +1686,7 @@
 					</div>
 					<div class="g-stat">
 						<div class="g-stat-value text-[#137333]">{preview.eventCount}</div>
-						<div class="g-stat-label">Atrakcje</div>
+						<div class="g-stat-label">{schedulerMode === 'people' ? 'Osoby do zaplanowania' : 'Atrakcje'}</div>
 					</div>
 					<div class="g-stat">
 						<div class="g-stat-value text-[#9334e6]">{preview.rooms.length}</div>
@@ -1106,8 +1704,8 @@
 						<thead class="sticky top-0 bg-muted">
 							<tr>
 								<th class="text-left p-2">Prowadzący</th>
-								<th class="text-center p-2">Szt.</th>
-								<th class="text-left p-2">Atrakcje</th>
+								<th class="text-center p-2">{schedulerMode === 'people' ? 'Min/Max' : 'Szt.'}</th>
+								<th class="text-left p-2">{schedulerMode === 'people' ? 'Tagi / dyspozycyjność' : 'Atrakcje'}</th>
 							</tr>
 						</thead>
 						<tbody>
@@ -1115,21 +1713,37 @@
 								<tr class="border-t align-top">
 									<td class="p-2 font-medium">{person.display_name}</td>
 									<td class="p-2 text-center text-muted-foreground tabular-nums">
-										{person.events.filter((e) => e.title.trim()).length}
+										{#if schedulerMode === 'people'}
+											{person.min_blocks || '—'} / {person.max_blocks || '—'}
+										{:else}
+											{person.events.filter((e) => e.title.trim()).length}
+										{/if}
 									</td>
 									<td class="p-2">
-										<ul class="space-y-1.5">
-											{#each person.events.filter((e) => e.title.trim()) as event}
-												<li class="leading-snug">
-													<span class="text-foreground" title={event.title}>
-														{truncateTitle(event.title)}
-													</span>
-													<span class="text-muted-foreground/70 text-xs whitespace-nowrap">
-														· {event.duration_minutes} min · T{event.tier ?? 2}
-													</span>
-												</li>
-											{/each}
-										</ul>
+										{#if schedulerMode === 'people'}
+											<span class="text-muted-foreground text-xs">
+												wykluczające: {person.conflict_tags || '—'} · wspólny slot: {person.co_schedule_tags || '—'} ·
+												preferencje: {typeof person.tag_preferences === 'string'
+													? person.tag_preferences || '—'
+													: Object.entries(person.tag_preferences || {})
+															.map(([tag, tier]) => `${tag}:${tier}`)
+															.join(', ') || '—'} ·
+												{person.availability_notes || 'domyślnie dostępny'}
+											</span>
+										{:else}
+											<ul class="space-y-1.5">
+												{#each person.events.filter((e) => e.title.trim()) as event}
+													<li class="leading-snug">
+														<span class="text-foreground" title={event.title}>
+															{truncateTitle(event.title)}
+														</span>
+														<span class="text-muted-foreground/70 text-xs whitespace-nowrap">
+															· {event.duration_minutes} min · T{event.tier ?? 2}
+														</span>
+													</li>
+												{/each}
+											</ul>
+										{/if}
 									</td>
 								</tr>
 							{/each}

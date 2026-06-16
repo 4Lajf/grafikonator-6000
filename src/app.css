@@ -150,6 +150,22 @@
     font-weight: 400;
   }
 
+  .g-app-actions {
+    @apply flex min-w-0 items-center gap-3;
+  }
+
+  .g-profile-switcher {
+    @apply hidden min-w-0 sm:block;
+  }
+
+  .g-profile-select {
+    @apply h-9 max-w-52 rounded-md border border-input bg-card px-3 py-1 text-sm text-foreground outline-none transition-[border-color,box-shadow];
+  }
+
+  .g-profile-select:focus {
+    @apply border-primary ring-1 ring-primary/30;
+  }
+
   .g-nav {
     @apply flex items-center gap-1;
   }
@@ -180,7 +196,7 @@
   }
 
   .g-card-grid {
-    @apply grid items-stretch gap-4 md:grid-cols-2;
+    @apply grid items-stretch gap-4 md:grid-cols-2 xl:grid-cols-3;
   }
 
   .g-product-card {

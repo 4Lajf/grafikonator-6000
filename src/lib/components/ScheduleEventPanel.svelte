@@ -2,16 +2,23 @@
 	import {
 		getPersonAvailabilityGrid,
 		updateSchedule,
+		updatePeopleSchedule,
 		createSchedule,
+		createPeopleSchedule,
 		setAvailability,
 		validateScheduleMove,
+		validatePeopleScheduleMove,
 		validateEventPlacement,
+		validatePersonPlacement,
 		deleteSchedule,
+		deletePeopleSchedule,
 		updateEvent,
+		updatePerson,
 		TIER_OPTIONS,
 		EVENT_TIER_OPTIONS
 	} from '$lib/database.js';
 	import { toast } from 'svelte-sonner';
+	import ColorPicker from '$lib/components/ColorPicker.svelte';
 	import { CircleAlert, TriangleAlert, X, Pencil, Trash2, Lock, Unlock } from 'lucide-svelte';
 
 	let {
@@ -19,6 +26,7 @@
 		unscheduledEvent = null,
 		anchorRect = null,
 		convention = null,
+		mode = 'events',
 		rooms = [],
 		timeSlots = [],
 		issues = [],
@@ -37,6 +45,18 @@
 	let estimatedAttendance = $state('');
 	let requiredRoomTags = $state('');
 	let eventKind = $state('');
+	let color = $state('');
+	let conflictTags = $state('');
+	let coScheduleTags = $state('');
+	const STATION_PREFERENCE_OPTIONS = [
+		{ value: 1, label: 'Chcę' },
+		{ value: 2, label: 'Tylko w razie potrzeby' },
+		{ value: 3, label: 'Nie chcę' }
+	];
+
+	let tagPreferencesMap = $state({});
+	let minBlocks = $state('');
+	let maxBlocks = $state('');
 	let scheduleForm = $state(null);
 	let validationMessage = $state('');
 	let validationSeverity = $state('');
@@ -65,9 +85,11 @@
 	const scheduleIssues = $derived(
 		schedule ? issues.filter((issue) => issue.scheduleId === schedule.id) : []
 	);
+	const isPeopleMode = $derived(mode === 'people');
 	const hostId = $derived(
 		schedule?.hosts?.[0]?.id ?? unscheduledEvent?.hosts?.[0]?.id ?? null
 	);
+	const personId = $derived(schedule?.person_id ?? unscheduledEvent?.person?.id ?? unscheduledEvent?.id ?? hostId);
 	const panelTitle = $derived(schedule?.event?.title ?? unscheduledEvent?.title ?? '');
 	const panelDuration = $derived(
 		schedule?.event?.duration_minutes ?? unscheduledEvent?.duration_minutes ?? 0
@@ -86,6 +108,23 @@
 		(schedule?.event?.required_room_tags ?? unscheduledEvent?.required_room_tags ?? []).join(', ')
 	);
 	const panelEventKind = $derived(schedule?.event?.kind ?? unscheduledEvent?.kind ?? '');
+	const panelColor = $derived(
+		schedule?.event?.color ?? schedule?.person?.color ?? unscheduledEvent?.color ?? unscheduledEvent?.person?.color ?? ''
+	);
+	const panelConflictTags = $derived(
+		(schedule?.event?.conflict_tags ?? schedule?.person?.conflict_tags ?? unscheduledEvent?.conflict_tags ?? unscheduledEvent?.person?.conflict_tags ?? []).join(', ')
+	);
+	const panelCoScheduleTags = $derived(
+		(schedule?.event?.co_schedule_tags ?? schedule?.person?.co_schedule_tags ?? unscheduledEvent?.co_schedule_tags ?? unscheduledEvent?.person?.co_schedule_tags ?? []).join(', ')
+	);
+	const panelTagPreferencesMap = $derived(
+		schedule?.person?.tag_preferences ?? unscheduledEvent?.person?.tag_preferences ?? {}
+	);
+	const panelPersonNotes = $derived(
+		schedule?.person?.notes ?? unscheduledEvent?.person?.notes ?? unscheduledEvent?.notes ?? ''
+	);
+	const panelMinBlocks = $derived(schedule?.person?.min_blocks ?? unscheduledEvent?.person?.min_blocks ?? '');
+	const panelMaxBlocks = $derived(schedule?.person?.max_blocks ?? unscheduledEvent?.person?.max_blocks ?? '');
 	const scheduleLocked = $derived(schedule?.locked === true);
 	const eventId = $derived(schedule?.event?.id ?? unscheduledEvent?.id ?? null);
 	const hostLabel = $derived(
@@ -131,10 +170,23 @@
 		eventId != null &&
 			(String(estimatedAttendance) !== String(panelEstimatedAttendance ?? '') ||
 				requiredRoomTags !== panelRequiredRoomTags ||
-				eventKind !== panelEventKind)
+				eventKind !== panelEventKind ||
+				color !== String(panelColor ?? '') ||
+				conflictTags !== panelConflictTags ||
+				coScheduleTags !== panelCoScheduleTags)
 	);
-	const eventSettingsDirty = $derived(eventTierDirty || autoScheduleDirty || eventMetadataDirty);
-	const isDirty = $derived(tiersDirty || scheduleDirty || eventSettingsDirty);
+	const personSettingsDirty = $derived(
+		isPeopleMode &&
+			personId != null &&
+			(color !== String(panelColor ?? '') ||
+				conflictTags !== panelConflictTags ||
+				coScheduleTags !== panelCoScheduleTags ||
+				JSON.stringify(tagPreferencesMap) !== JSON.stringify(panelTagPreferencesMap) ||
+				String(minBlocks) !== String(panelMinBlocks ?? '') ||
+				String(maxBlocks) !== String(panelMaxBlocks ?? ''))
+	);
+	const eventSettingsDirty = $derived(!isPeopleMode && (eventTierDirty || autoScheduleDirty || eventMetadataDirty));
+	const isDirty = $derived(tiersDirty || scheduleDirty || eventSettingsDirty || personSettingsDirty);
 
 	function formatTime(timeStr) {
 		return String(timeStr || '').slice(0, 5);
@@ -168,6 +220,14 @@
 		setSlotTier(slotId, current === 3 ? 1 : current + 1);
 	}
 
+	function updateTagPreference(stationName, value) {
+		tagPreferencesMap = { ...tagPreferencesMap, [stationName]: Number(value) };
+	}
+
+	function stationPreferenceFor(stationName) {
+		return Number(tagPreferencesMap[stationName] ?? 2);
+	}
+
 	function initForms(grid = availabilityGrid) {
 		const allSlots = grid.flatMap((day) => day.slots);
 		slotTiers = Object.fromEntries(allSlots.map((slot) => [slot.id, slot.tier]));
@@ -176,6 +236,12 @@
 		estimatedAttendance = String(panelEstimatedAttendance ?? '');
 		requiredRoomTags = panelRequiredRoomTags;
 		eventKind = panelEventKind;
+		color = String(panelColor ?? '');
+		conflictTags = panelConflictTags;
+		coScheduleTags = panelCoScheduleTags;
+		tagPreferencesMap = { ...panelTagPreferencesMap };
+		minBlocks = panelMinBlocks ?? '';
+		maxBlocks = panelMaxBlocks ?? '';
 		if (schedule) {
 			scheduleForm = {
 				room_id: schedule.room_id,
@@ -221,17 +287,29 @@
 
 	async function previewScheduleEdit() {
 		if (!scheduleForm) return;
-		const validation = unscheduledEvent
-			? await validateEventPlacement(
-					unscheduledEvent.id,
-					scheduleForm.room_id,
-					scheduleForm.start_time_slot_id
-				)
-			: await validateScheduleMove(
-					schedule.id,
-					scheduleForm.room_id,
-					scheduleForm.start_time_slot_id
-				);
+		const validation = isPeopleMode
+			? unscheduledEvent
+				? await validatePersonPlacement(
+						personId,
+						scheduleForm.room_id,
+						scheduleForm.start_time_slot_id
+					)
+				: await validatePeopleScheduleMove(
+						schedule.id,
+						scheduleForm.room_id,
+						scheduleForm.start_time_slot_id
+					)
+			: unscheduledEvent
+				? await validateEventPlacement(
+						unscheduledEvent.id,
+						scheduleForm.room_id,
+						scheduleForm.start_time_slot_id
+					)
+				: await validateScheduleMove(
+						schedule.id,
+						scheduleForm.room_id,
+						scheduleForm.start_time_slot_id
+					);
 		if (!validation.valid) {
 			validationSeverity = 'error';
 			validationMessage = validation.reason || 'Konflikt w grafiku';
@@ -257,22 +335,37 @@
 		try {
 			if (scheduleDirty) {
 				if (unscheduledEvent) {
-					await createSchedule({
-						event_id: unscheduledEvent.id,
-						room_id: scheduleForm.room_id,
-						start_time_slot_id: scheduleForm.start_time_slot_id,
-						slot_count: slotCount
-					});
+					if (isPeopleMode) {
+						await createPeopleSchedule({
+							person_id: personId,
+							room_id: scheduleForm.room_id,
+							time_slot_id: scheduleForm.start_time_slot_id
+						});
+					} else {
+						await createSchedule({
+							event_id: unscheduledEvent.id,
+							room_id: scheduleForm.room_id,
+							start_time_slot_id: scheduleForm.start_time_slot_id,
+							slot_count: slotCount
+						});
+					}
 				} else {
 					if (scheduleLocked) {
 						toast.error('Pozycja zablokowana — odblokuj ją przed zmianą grafiku');
 						return;
 					}
-					await updateSchedule(schedule.id, {
-						room_id: scheduleForm.room_id,
-						start_time_slot_id: scheduleForm.start_time_slot_id,
-						slot_count: schedule.slot_count
-					});
+					if (isPeopleMode) {
+						await updatePeopleSchedule(schedule.id, {
+							room_id: scheduleForm.room_id,
+							time_slot_id: scheduleForm.start_time_slot_id
+						});
+					} else {
+						await updateSchedule(schedule.id, {
+							room_id: scheduleForm.room_id,
+							start_time_slot_id: scheduleForm.start_time_slot_id,
+							slot_count: schedule.slot_count
+						});
+					}
 				}
 			}
 
@@ -297,11 +390,25 @@
 					auto_schedule: Boolean(autoSchedule),
 					estimated_attendance: estimatedAttendance,
 					required_room_tags: requiredRoomTags,
-					kind: eventKind.trim() || null
+					kind: eventKind.trim() || null,
+					color,
+					conflict_tags: conflictTags,
+					co_schedule_tags: coScheduleTags
 				});
 			}
 
-			toast.success(unscheduledEvent && scheduleDirty ? 'Zaplanowano atrakcję' : 'Zapisano zmiany');
+			if (personSettingsDirty && personId) {
+				await updatePerson(personId, {
+					color,
+					conflict_tags: conflictTags,
+					co_schedule_tags: coScheduleTags,
+					tag_preferences: tagPreferencesMap,
+					min_blocks: minBlocks,
+					max_blocks: maxBlocks
+				});
+			}
+
+			toast.success(unscheduledEvent && scheduleDirty ? 'Zaplanowano pozycję' : 'Zapisano zmiany');
 			editingSchedule = false;
 			onsaved({
 				scheduleChanged: scheduleDirty || eventSettingsDirty,
@@ -322,7 +429,11 @@
 	async function handleDelete() {
 		if (!confirm(`Usunąć „${schedule.event.title}" z grafiku?`)) return;
 		try {
-			await deleteSchedule(schedule.id);
+			if (isPeopleMode) {
+				await deletePeopleSchedule(schedule.id);
+			} else {
+				await deleteSchedule(schedule.id);
+			}
 			toast.success('Usunięto z grafiku');
 			onsaved({ scheduleChanged: true });
 			onclose();
@@ -335,7 +446,11 @@
 		if (!schedule) return;
 		saving = true;
 		try {
-			await updateSchedule(schedule.id, { locked: !scheduleLocked });
+			if (isPeopleMode) {
+				await updatePeopleSchedule(schedule.id, { locked: !scheduleLocked });
+			} else {
+				await updateSchedule(schedule.id, { locked: !scheduleLocked });
+			}
 			toast.success(scheduleLocked ? 'Odblokowano pozycję' : 'Zablokowano pozycję');
 			editingSchedule = false;
 			onsaved({ scheduleChanged: true });
@@ -367,7 +482,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="panel-backdrop" onclick={handleBackdropClick}></div>
 
-	<div class="event-panel" style={panelStyle} role="dialog" aria-label="Szczegóły atrakcji">
+	<div class="event-panel" style={panelStyle} role="dialog" aria-label="Szczegóły pozycji">
 		<header class="panel-header">
 			<div class="panel-header-text">
 				<h2>{panelTitle}</h2>
@@ -375,7 +490,7 @@
 					{#if schedule}
 						{formatTime(schedule.start_slot?.start_time)}–{getEndTime()} · {schedule.room?.name}
 					{:else}
-						Niezaplanowane · {panelDuration} min
+						Do zaplanowania · {panelDuration} min
 					{/if}
 				</p>
 			</div>
@@ -420,8 +535,9 @@
 						</div>
 						<div class="panel-hype-cell panel-hype-cell--narrow">
 							<span class="panel-hype-label">Czas</span>
-							<span class="panel-hype-value">{panelDuration} min</span>
+							<span class="panel-hype-value">{isPeopleMode ? `${convention?.slot_minutes ?? 30} min` : `${panelDuration} min`}</span>
 						</div>
+						{#if !isPeopleMode}
 						<div class="panel-hype-cell panel-hype-cell--tier">
 							<span class="panel-hype-label">Tier atrakcji</span>
 							<div class="tier-buttons tier-buttons--compact">
@@ -446,8 +562,14 @@
 								<span class="panel-hype-value">Planuj automatycznie</span>
 							</span>
 						</label>
+						{/if}
 					</div>
-					{#if panelOrganizerNotes?.trim()}
+					{#if isPeopleMode && panelPersonNotes?.trim()}
+						<p class="panel-hype-notes">
+							<span class="panel-hype-label">Notatki</span>
+							{panelPersonNotes}
+						</p>
+					{:else if panelOrganizerNotes?.trim()}
 						<p class="panel-hype-notes">
 							<span class="panel-hype-label">Notatki</span>
 							{panelOrganizerNotes}
@@ -456,20 +578,67 @@
 				</section>
 
 				<section class="panel-section">
-					<h3>Wymagania sali</h3>
+					<h3>{isPeopleMode ? 'Ustawienia w grafiku' : 'Wymagania sali'}</h3>
 					<div class="panel-form-grid">
+						{#if isPeopleMode}
+							<label class="panel-field">
+								<span>Min. slotów</span>
+								<input type="number" min="0" bind:value={minBlocks} />
+							</label>
+							<label class="panel-field">
+								<span>Maks. slotów</span>
+								<input type="number" min="0" bind:value={maxBlocks} />
+							</label>
+						{:else}
+							<label class="panel-field">
+								<span>Szacowana frekwencja</span>
+								<input type="number" min="0" bind:value={estimatedAttendance} placeholder="np. 50" />
+							</label>
+							<label class="panel-field">
+								<span>Typ atrakcji</span>
+								<input bind:value={eventKind} placeholder="np. Prelekcja, Konkurs, Warsztaty" />
+							</label>
+							<label class="panel-field panel-field--full">
+								<span>Wymagane tagi sali</span>
+								<input bind:value={requiredRoomTags} placeholder="projector, quiet_room" />
+							</label>
+						{/if}
+						<div class="panel-field">
+							<span>Kolor</span>
+							<ColorPicker bind:value={color} />
+						</div>
 						<label class="panel-field">
-							<span>Szacowana frekwencja</span>
-							<input type="number" min="0" bind:value={estimatedAttendance} placeholder="np. 50" />
-						</label>
-						<label class="panel-field">
-							<span>Typ atrakcji</span>
-							<input bind:value={eventKind} placeholder="np. Prelekcja, Konkurs, Warsztaty" />
+							<span>Tagi wykluczające</span>
+							<input bind:value={conflictTags} placeholder="np. prowadzący, konkurs" />
 						</label>
 						<label class="panel-field panel-field--full">
-							<span>Wymagane tagi sali</span>
-							<input bind:value={requiredRoomTags} placeholder="projector, quiet_room" />
+							<span>Tagi wspólnego slotu</span>
+							<input bind:value={coScheduleTags} placeholder="np. jury, ekipa techniczna" />
 						</label>
+						{#if isPeopleMode}
+							<div class="panel-field panel-field--full">
+								<span>Preferencje stanowisk</span>
+								<div class="panel-station-grid">
+									{#each rooms as room}
+										<label class="panel-station-item">
+											<span class="panel-station-name">{room.name}</span>
+											<select
+												class="panel-station-select"
+												value={stationPreferenceFor(room.name)}
+												onchange={(event) =>
+													updateTagPreference(room.name, event.currentTarget.value)}
+											>
+												{#each STATION_PREFERENCE_OPTIONS as option}
+													<option value={option.value}>{option.label}</option>
+												{/each}
+											</select>
+										</label>
+									{:else}
+										<p class="panel-station-empty">Brak stanowisk — dodaj je w zakładce Konwent.</p>
+									{/each}
+								</div>
+							</div>
+						{/if}
 					</div>
 				</section>
 
@@ -546,7 +715,7 @@
 						<div class="panel-lock-state" class:panel-lock-state--locked={scheduleLocked}>
 							{#if scheduleLocked}
 								<Lock size={14} />
-								<span>Pozycja zablokowana — ta atrakcja nie będzie przenoszona.</span>
+								<span>Pozycja zablokowana — ten wpis nie będzie przenoszony.</span>
 							{:else}
 								<Unlock size={14} />
 								<span>Pozycja odblokowana.</span>
@@ -779,6 +948,43 @@
 
 	.panel-field--full {
 		grid-column: 1 / -1;
+	}
+
+	.panel-station-grid {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 0.375rem;
+		margin-top: 0.25rem;
+	}
+
+	.panel-station-item {
+		display: grid;
+		gap: 0.25rem;
+		padding: 0.375rem 0.5rem;
+		border: 1px solid #dadce0;
+		border-radius: 6px;
+		background: #fff;
+	}
+
+	.panel-station-name {
+		font-size: 11px;
+		font-weight: 500;
+		color: #202124;
+	}
+
+	.panel-station-select {
+		width: 100%;
+		font-size: 11px;
+		padding: 0.25rem 0.375rem;
+		border: 1px solid #dadce0;
+		border-radius: 4px;
+		background: #fff;
+	}
+
+	.panel-station-empty {
+		margin: 0;
+		font-size: 11px;
+		color: #5f6368;
 	}
 
 	.panel-section--availability {

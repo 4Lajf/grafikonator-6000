@@ -33,6 +33,20 @@ export function parseCsv(csvText) {
 	};
 }
 
+export function parseCsvRows(csvText) {
+	const result = Papa.parse(csvText, {
+		header: false,
+		skipEmptyLines: false
+	});
+	if (result.errors.length > 0) {
+		const message = result.errors.map((e) => e.message).join('; ');
+		throw new Error(`Błąd parsowania CSV: ${message}`);
+	}
+	return /** @type {string[][]} */ (result.data).map((row) =>
+		row.map((cell) => String(cell ?? '').trim())
+	);
+}
+
 /** Columns ignored during import (not shown as mappable fields). */
 const SKIP_PATTERNS = [
 	/rodo|gdpr|klauzula|privacy|zgod/i,

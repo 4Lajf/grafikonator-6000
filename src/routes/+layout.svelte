@@ -2,10 +2,17 @@
 	import '../app.css';
 	import { Toaster } from 'svelte-sonner';
 	import { page } from '$app/stores';
+	import { afterNavigate } from '$app/navigation';
+	import { onMount } from 'svelte';
+	import { getConventions, setActiveConvention } from '$lib/database.js';
 
 	let { children } = $props();
+	let profiles = $state([]);
+	let activeProfileId = $state('');
+	let profileLoading = $state(false);
 
 	const navLinks = [
+		{ href: '/profiles', label: 'Profile' },
 		{ href: '/setup', label: 'Import' },
 		{ href: '/convention', label: 'Konwent' },
 		{ href: '/people', label: 'Osoby' },
@@ -17,6 +24,41 @@
 	function isActive(href, pathname) {
 		return pathname === href || pathname.startsWith(`${href}/`);
 	}
+
+	async function loadProfiles() {
+		try {
+			const data = await getConventions();
+			profiles = data.conventions;
+			activeProfileId = data.activeId ?? '';
+		} catch {
+			profiles = [];
+			activeProfileId = '';
+		}
+	}
+
+	async function handleProfileChange(event) {
+		const nextId = event.currentTarget.value;
+		if (!nextId || nextId === activeProfileId) return;
+		profileLoading = true;
+		try {
+			await setActiveConvention(nextId);
+			activeProfileId = nextId;
+			window.location.reload();
+		} finally {
+			profileLoading = false;
+		}
+	}
+
+	onMount(() => {
+		loadProfiles();
+		const refresh = () => loadProfiles();
+		window.addEventListener('profiles-changed', refresh);
+		return () => window.removeEventListener('profiles-changed', refresh);
+	});
+
+	afterNavigate(() => {
+		loadProfiles();
+	});
 </script>
 
 <div class="flex min-h-screen flex-col bg-background">
@@ -26,17 +68,35 @@
 				<span class="g-brand-text">Grafikonator 6000</span>
 			</a>
 
-			<nav class="g-nav" aria-label="Główne">
-				{#each navLinks as link}
-					<a
-						href={link.href}
-						class="g-nav-link"
-						class:g-nav-link--active={isActive(link.href, $page.url.pathname)}
-					>
-						{link.label}
-					</a>
-				{/each}
-			</nav>
+			<div class="g-app-actions">
+				{#if profiles.length > 0}
+					<label class="g-profile-switcher" title="Aktywny profil">
+						<span class="sr-only">Aktywny profil</span>
+						<select
+							class="g-profile-select"
+							value={activeProfileId}
+							disabled={profileLoading}
+							onchange={handleProfileChange}
+						>
+							{#each profiles as profile}
+								<option value={profile.id}>{profile.name}</option>
+							{/each}
+						</select>
+					</label>
+				{/if}
+
+				<nav class="g-nav" aria-label="Glowne">
+					{#each navLinks as link}
+						<a
+							href={link.href}
+							class="g-nav-link"
+							class:g-nav-link--active={isActive(link.href, $page.url.pathname)}
+						>
+							{link.label}
+						</a>
+					{/each}
+				</nav>
+			</div>
 		</div>
 	</header>
 

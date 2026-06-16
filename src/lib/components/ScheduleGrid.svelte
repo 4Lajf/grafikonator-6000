@@ -5,18 +5,28 @@
 		getRooms,
 		getTimeSlots,
 		getSchedules,
+		getPeopleSchedules,
 		getUnscheduledEvents,
+		getPeople,
+		getPersonHours,
 		autoScheduleAll,
 		clearAllSchedules,
 		createSchedule,
+		createPeopleSchedule,
 		updateSchedule,
+		updatePeopleSchedule,
+		movePeopleSchedules,
+		swapPeopleSchedules,
 		deleteSchedule,
+		deletePeopleSchedule,
+		getUndoHistory,
+		undoLastActions,
 		getAvailability
 	} from '$lib/database.js';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Card from '$lib/components/ui/card/card.svelte';
 	import { toast } from 'svelte-sonner';
-	import { CircleAlert, TriangleAlert, ArrowUpDown, Lock } from 'lucide-svelte';
+	import { CircleAlert, TriangleAlert, ArrowUpDown, Lock, Search, X } from 'lucide-svelte';
 	import ScheduleEventPanel from '$lib/components/ScheduleEventPanel.svelte';
 
 	function waitForPaint() {
@@ -37,8 +47,13 @@
 	let timeSlots = $state([]);
 	let schedules = $state([]);
 	let unscheduled = $state([]);
+	let people = $state([]);
+	let personHours = $state([]);
+	let undoHistory = $state([]);
+	let selectedSlot = $state(null);
 	/** @type {'none' | 'asc' | 'desc'} */
 	let unscheduledSort = $state('none');
+	let sidebarSearch = $state('');
 	let availability = $state([]);
 	let loading = $state(true);
 	let autoScheduling = $state(false);
@@ -50,6 +65,11 @@
 	let daySections = $state([]);
 	let selectedSchedule = $state(null);
 	let selectedUnscheduledEvent = $state(null);
+	let highlightedIssueScheduleIds = $state(new Set());
+	let highlightedIssueKey = $state('');
+	let highlightedIssueSeverity = $state(null);
+	let highlightedIssueRoomId = $state(null);
+	let highlightedIssueSlotIds = $state(new Set());
 	let panelAnchorRect = $state(null);
 	let blockNextClick = $state(false);
 	let chainSwap = $state({
@@ -67,7 +87,7 @@
 	const TIME_COL_WIDTH = 56;
 	const ROOM_COL_WIDTH_BASE = 240;
 	const ROOM_COL_WIDTH_HOURLY = 300;
-	const SLOT_HEIGHT = 30;
+	const SLOT_HEIGHT = 54;
 	const DRAG_THRESHOLD = 5;
 	const PREVIEW_SCHEDULE_ID = '__preview__';
 	const CHAIN_SWAP_MAX_DEPTH = 5;
@@ -79,12 +99,20 @@
 	const roomColumnWidth = $derived(
 		convention?.slot_minutes >= 60 ? ROOM_COL_WIDTH_HOURLY : ROOM_COL_WIDTH_BASE
 	);
+	const isPeopleMode = $derived(convention?.schedule_mode === 'people');
 
 	let dragState = $state(null);
 	let dropPreview = $state(null);
 	let placementHints = $state({ cells: new Map(), swaps: new Map() });
 
 	let dropPreviewFrame = null;
+	let progressiveSwapFrame = null;
+	let progressiveSwapScrollFrame = null;
+	let progressiveSwapItem = null;
+	let progressiveSwapQueue = [];
+	let progressiveQueuedSwapIds = new Set();
+	let progressiveComputedSwapIds = new Set();
+	let hintComputeToken = 0;
 	let pendingPreviewCoords = null;
 	let dropTargetRects = [];
 	let sheetScrollEl = $state(null);
@@ -112,15 +140,47 @@
 	};
 
 	const OK_TILE_COLORS = TIER_COLORS[1];
+	const PENDING_SWAP_COLORS = {
+		bg: '#f1f3f4',
+		border: '#9aa0a6',
+		text: '#5f6368',
+		label: 'Sprawdzam…',
+		kind: 'pending',
+		messages: ['Sprawdzam, czy ta zamiana przejdzie…']
+	};
+
+	const sidebarSearchTerm = $derived(normalizeSearchText(sidebarSearch));
+	const sidebarTotalCount = $derived(isPeopleMode ? people.length : unscheduled.length);
 
 	const displayedUnscheduled = $derived.by(() => {
-		const list = [...unscheduled];
-		if (unscheduledSort === 'asc') {
-			list.sort((a, b) => Number(a.tier ?? 2) - Number(b.tier ?? 2));
-		} else if (unscheduledSort === 'desc') {
-			list.sort((a, b) => Number(b.tier ?? 2) - Number(a.tier ?? 2));
+		let list;
+		if (isPeopleMode) {
+			const hoursById = new Map(personHours.map((entry) => [entry.id, entry]));
+			list = people.map((person) => ({
+				id: person.id,
+				title: person.display_name,
+				duration_minutes: convention?.slot_minutes ?? 30,
+				tier: 2,
+				auto_schedule: 1,
+				host_name: person.display_name,
+				hosts: [{ id: person.id, display_name: person.display_name }],
+				person,
+				color: person.color,
+				notes: person.notes,
+				conflict_tags: person.conflict_tags,
+				co_schedule_tags: person.co_schedule_tags,
+				hours: hoursById.get(person.id)
+			}));
+		} else {
+			list = [...unscheduled];
+			if (unscheduledSort === 'asc') {
+				list.sort((a, b) => Number(a.tier ?? 2) - Number(b.tier ?? 2));
+			} else if (unscheduledSort === 'desc') {
+				list.sort((a, b) => Number(b.tier ?? 2) - Number(a.tier ?? 2));
+			}
 		}
-		return list;
+		if (!sidebarSearchTerm) return list;
+		return list.filter((item) => sidebarItemMatchesSearch(item, sidebarSearchTerm));
 	});
 
 	const unscheduledSortTitle = $derived(
@@ -131,8 +191,10 @@
 				: 'Tier malejąco — kliknij: bez sortowania'
 	);
 	const autoSchedulableCount = $derived(
-		schedules.filter((schedule) => schedule.event?.auto_schedule !== 0).length +
-			unscheduled.filter((event) => event.auto_schedule !== 0).length
+		isPeopleMode
+			? people.length
+			: schedules.filter((schedule) => schedule.event?.auto_schedule !== 0).length +
+					unscheduled.filter((event) => event.auto_schedule !== 0).length
 	);
 	const chainSwapSource = $derived(
 		chainSwap.sourceScheduleId
@@ -201,6 +263,12 @@
 			).map((schedule) => schedule.id)
 		);
 	});
+	const activeHintItem = $derived.by(() => {
+		if (dragState?.moved) return dragState.item;
+		if (selectedSchedule) return { id: selectedSchedule.id, schedule: selectedSchedule };
+		if (selectedUnscheduledEvent) return makeUnscheduledDragItem(selectedUnscheduledEvent);
+		return null;
+	});
 
 	const ISSUE_COLORS = {
 		error: { bg: '#fce8e6', border: '#ea4335', text: '#c5221f', label: 'Błąd' },
@@ -216,6 +284,91 @@
 		unscheduledSort =
 			unscheduledSort === 'none' ? 'asc' : unscheduledSort === 'asc' ? 'desc' : 'none';
 	}
+
+	function normalizeSearchText(value) {
+		return String(value ?? '')
+			.normalize('NFD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.replace(/\u0142/g, 'l')
+			.replace(/\u0141/g, 'l')
+			.toLowerCase()
+			.trim();
+	}
+
+	function flattenSearchValue(value) {
+		if (value == null) return '';
+		if (Array.isArray(value)) return value.map(flattenSearchValue).join(' ');
+		if (typeof value === 'object') {
+			return Object.entries(value)
+				.flatMap(([key, entry]) => [key, entry])
+				.map(flattenSearchValue)
+				.join(' ');
+		}
+		return String(value);
+	}
+
+	function sidebarItemMatchesSearch(item, term) {
+		const person = item?.person;
+		const searchable = [
+			item?.title,
+			item?.host_name,
+			item?.notes,
+			item?.organizer_notes,
+			item?.conflict_tags,
+			item?.co_schedule_tags,
+			item?.hosts?.map((host) => host.display_name),
+			person?.display_name,
+			person?.notes,
+			person?.availability_notes,
+			person?.conflict_tags,
+			person?.co_schedule_tags,
+			person?.tag_preferences
+		]
+			.map(flattenSearchValue)
+			.join(' ');
+
+		return normalizeSearchText(searchable).includes(term);
+	}
+
+	function scheduleMatchesSearch(schedule, term) {
+		const person = schedule?.person;
+		const event = schedule?.event;
+		const searchable = [
+			event?.title,
+			event?.kind,
+			event?.organizer_notes,
+			event?.conflict_tags,
+			event?.co_schedule_tags,
+			event?.required_room_tags,
+			schedule?.host_name,
+			schedule?.hosts?.map((host) => host.display_name),
+			schedule?.room?.name,
+			schedule?.start_slot?.date,
+			schedule?.start_slot?.start_time,
+			schedule?.start_slot?.end_time,
+			person?.display_name,
+			person?.notes,
+			person?.availability_notes,
+			person?.conflict_tags,
+			person?.co_schedule_tags,
+			person?.tag_preferences
+		]
+			.map(flattenSearchValue)
+			.join(' ');
+
+		return normalizeSearchText(searchable).includes(term);
+	}
+
+	// When the sidebar search is active, scheduled tiles that match are spotlighted
+	// and the rest dimmed. `null` means no active search (tiles render normally).
+	const searchMatchScheduleIds = $derived.by(() => {
+		if (!sidebarSearchTerm) return null;
+		const ids = new Set();
+		for (const schedule of schedules) {
+			if (scheduleMatchesSearch(schedule, sidebarSearchTerm)) ids.add(schedule.id);
+		}
+		return ids;
+	});
 
 	function isHourStart(timeStr) {
 		return formatTime(timeStr).endsWith(':00');
@@ -242,9 +395,15 @@
 		return timeSlots.filter((ts) => ts.date === date);
 	}
 
+	function getScheduleStartSlotId(schedule) {
+		return schedule?.start_time_slot_id ?? schedule?.time_slot_id ?? null;
+	}
+
 	function getEndTime(schedule) {
-		const dayTimeSlots = getDayTimeSlots(schedule.start_slot?.date);
-		const startIdx = dayTimeSlots.findIndex((ts) => ts.id === schedule.start_time_slot_id);
+		const startSlotId = getScheduleStartSlotId(schedule);
+		const startSlot = schedule.start_slot ?? hintIndexes.slotById.get(startSlotId);
+		const dayTimeSlots = getDayTimeSlots(startSlot?.date);
+		const startIdx = dayTimeSlots.findIndex((ts) => ts.id === startSlotId);
 		if (startIdx < 0) return '';
 		const endSlot = dayTimeSlots[startIdx + schedule.slot_count - 1];
 		return formatTime(endSlot?.end_time);
@@ -269,7 +428,8 @@
 	}
 
 	function getSlotRange(schedule, dayTimeSlots = getDayTimeSlots(schedule.start_slot?.date)) {
-		const startIdx = dayTimeSlots.findIndex((ts) => ts.id === schedule.start_time_slot_id);
+		const startSlotId = getScheduleStartSlotId(schedule);
+		const startIdx = dayTimeSlots.findIndex((ts) => ts.id === startSlotId);
 		if (startIdx < 0) return [];
 		return dayTimeSlots.slice(startIdx, startIdx + schedule.slot_count).map((s) => s.id);
 	}
@@ -338,6 +498,68 @@
 		return tags;
 	}
 
+	function getSchedulePerson(schedule) {
+		const personId =
+			schedule?.person_id ??
+			schedule?.event?.person?.id ??
+			schedule?.hosts?.[0]?.id ??
+			schedule?.event?.id;
+		return (
+			schedule?.person ??
+			schedule?.event?.person ??
+			people.find((person) => person.id === personId) ??
+			null
+		);
+	}
+
+	function normalizePreferenceTierValue(value) {
+		const numeric = Number(value);
+		if ([1, 2, 3].includes(numeric)) return numeric;
+		const text = String(value ?? '')
+			.trim()
+			.toLowerCase();
+		if (!text) return null;
+		if (['x', 'tak', 'chce', 'chcę', 'spoko', 'ok'].includes(text)) return 1;
+		if (
+			[
+				'o',
+				'obojętnie',
+				'obojetnie',
+				'jak braki',
+				'jak będą braki',
+				'jak beda braki',
+				'tylko w razie potrzeby',
+				'tylko jeśli będzie potrzeba',
+				'tylko jesli bedzie potrzeba',
+				'jeśli będzie potrzeba',
+				'jesli bedzie potrzeba',
+				'if needed'
+			].includes(text)
+		) {
+			return 2;
+		}
+		if (['-', '#', 'nie', 'nie chce', 'nie chcę', 'nie mogę', 'nie moge'].includes(text)) {
+			return 3;
+		}
+		return null;
+	}
+
+	function getPersonRoomPreferenceTier(person, room) {
+		const preferences = person?.tag_preferences || {};
+		let matched = null;
+		const roomPreferenceKeys = [...new Set([room?.name, ...getRoomTags(room)].filter(Boolean))];
+		for (const tag of roomPreferenceKeys) {
+			const entry = Object.entries(preferences).find(
+				([prefTag]) => prefTag.toLowerCase() === tag.toLowerCase()
+			);
+			const tier = normalizePreferenceTierValue(entry?.[1]);
+			if (tier) matched = matched == null ? tier : Math.max(matched, tier);
+		}
+		// An unset preference defaults to tier 2 ("tylko w razie potrzeby") so the
+		// highlighter shows blue, matching the preference dropdowns' default display.
+		return matched ?? 2;
+	}
+
 	function getRoomFitIssues(schedule, roomId = schedule?.room_id) {
 		const room = rooms.find((r) => r.id === roomId);
 		if (!room || !schedule?.event) return [];
@@ -402,8 +624,132 @@
 		return worstTier;
 	}
 
+	function getSlotAvailabilitySummary(slotId) {
+		const counts = { available: 0, prefer: 0, unavailable: 0 };
+		for (const person of people) {
+			const tier = getAvailabilityTier(person.id, slotId);
+			if (tier === 3) counts.unavailable++;
+			else if (tier === 2) counts.prefer++;
+			else counts.available++;
+		}
+		return counts;
+	}
+
+	function appearanceToSelectedTier(appearance) {
+		if (appearance?.kind === 'error') return 3;
+		if (appearance?.kind === 'warning' || appearance?.kind === 'info') return 2;
+		return 1;
+	}
+
+	function makePeopleModeEventForPerson(person) {
+		return {
+			id: person.id,
+			title: person.display_name,
+			tier: 2,
+			conflict_tags: person.conflict_tags,
+			co_schedule_tags: person.co_schedule_tags,
+			person
+		};
+	}
+
+	function getBestPersonFitForSlot(person, slot, roomId = null) {
+		if (!isPeopleMode || !slot) return null;
+		const day = daySections.find((section) => section.date === slot.date);
+		if (!day) return null;
+		const rowIdx = day.timeSlots.findIndex((entry) => entry.id === slot.id);
+		if (rowIdx < 0) return null;
+		const daySchedules = hintIndexes.daySchedules.get(day.date) ?? [];
+		const hostIds = new Set([person.id]);
+		let best = null;
+
+		// When a specific room/stanowisko is selected, only score that one; otherwise
+		// pick the person's best-fitting room for the slot.
+		const candidateRooms = roomId ? rooms.filter((room) => room.id === roomId) : rooms;
+		for (const room of candidateRooms) {
+			const appearance = evaluateScheduleAt(
+				hostIds,
+				room.id,
+				rowIdx,
+				1,
+				day,
+				daySchedules,
+				new Set(),
+				makePeopleModeEventForPerson(person)
+			);
+			const tier = appearanceToSelectedTier(appearance);
+			const candidate = { tier, appearance, room };
+			if (!best || candidate.tier < best.tier) best = candidate;
+			if (candidate.tier === 1) break;
+		}
+
+		return best;
+	}
+
+	function handleSlotClick(slot, event) {
+		if (!isPeopleMode) return;
+		if (dismissIssueFocusOnClick(event)) return;
+		// Clicking the active hour again turns the whole highlight mode off.
+		if (selectedSlot?.slot?.id === slot.id) {
+			selectedSlot = null;
+			return;
+		}
+		selectedSlot = { slot, roomId: null };
+	}
+
+	function handleRoomHighlightClick(room, event) {
+		if (!isPeopleMode || !selectedSlot?.slot?.id) return;
+		if (dismissIssueFocusOnClick(event)) return;
+		// Clicking the active room again drops back to the all-rooms view for the
+		// hour, without leaving highlight mode entirely.
+		selectedSlot = {
+			...selectedSlot,
+			roomId: selectedSlot.roomId === room.id ? null : room.id
+		};
+	}
+
+	const selectedHighlightRoom = $derived(
+		selectedSlot?.roomId ? rooms.find((room) => room.id === selectedSlot.roomId) : null
+	);
+
+	// Recomputed whenever the selected hour OR room changes, so the sidebar
+	// highlights track room/stanowisko selection, not just the hour. Keyed by
+	// person id (the sidebar event id in people mode).
+	const selectedSlotFits = $derived.by(() => {
+		const fits = new Map();
+		if (!isPeopleMode || !selectedSlot?.slot?.id) return fits;
+		const { slot, roomId } = selectedSlot;
+		for (const person of people) {
+			fits.set(person.id, getBestPersonFitForSlot(person, slot, roomId));
+		}
+		return fits;
+	});
+
+	function handleGridKeydown(event) {
+		if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+			event.preventDefault();
+			handleUndo(1);
+		}
+	}
+
 	function pushIssue(result, issue) {
-		result.push(issue);
+		const code = issue.code || inferIssueCode(issue.message);
+		result.push({ ...issue, code, priority: issue.priority ?? issuePriority(code, issue.severity) });
+	}
+
+	function inferIssueCode(message = '') {
+		const text = String(message).toLowerCase();
+		if (text.includes('niedostępny w tym czasie')) return 'availability-unavailable';
+		if (text.includes('tier atrakcji')) return 'tier-mismatch';
+		if (text.includes('tag')) return 'tag-conflict';
+		return 'generic';
+	}
+
+	function issuePriority(code, severity) {
+		if (code === 'availability-unavailable') return 0;
+		if (severity === SEVERITY.ERROR) return 10;
+		if (severity === SEVERITY.WARNING) return 20;
+		if (severity === SEVERITY.INFO) return 30;
+		return 40;
 	}
 
 	function pushHostAvailabilityIssues(result, sched, slotIds) {
@@ -432,21 +778,6 @@
 		}
 	}
 
-	function pushConsecutiveRunIssues(result, sorted, runStart, runEnd, hostId, consecutive) {
-		const person = schedules
-			.find((s) => s.id === sorted[runStart].sched.id)
-			?.hosts?.find((h) => h.id === hostId);
-		const message = `${person?.display_name || 'Prowadzący'}: ${consecutive} slotów bez przerwy`;
-		for (let j = runStart; j <= runEnd; j++) {
-			pushIssue(result, {
-				severity: SEVERITY.WARNING,
-				message,
-				scheduleId: sorted[j].sched.id,
-				personId: hostId
-			});
-		}
-	}
-
 	function dedupeIssues(issueList) {
 		const uniqueIssues = [];
 		const seen = new Set();
@@ -462,33 +793,53 @@
 
 	function getTileAppearance(scheduleId) {
 		const scheduleIssues = issues.filter((issue) => issue.scheduleId === scheduleId);
-		return appearanceFromIssues(scheduleIssues);
+		const appearance = appearanceFromIssues(scheduleIssues);
+		if (appearance.kind !== 'ok') return appearance;
+		const schedule = schedules.find((entry) => entry.id === scheduleId);
+		const customColor = schedule?.event?.color || schedule?.person?.color;
+		if (!customColor) return appearance;
+		return {
+			...appearance,
+			bg: customColor,
+			border: customColor,
+			text: '#ffffff'
+		};
 	}
 
 	function appearanceFromIssues(scheduleIssues, tier = 1, options = {}) {
-		const hasError = scheduleIssues.some((issue) => issue.severity === SEVERITY.ERROR);
-		const hasWarning = scheduleIssues.some((issue) => issue.severity === SEVERITY.WARNING);
-		const hasInfo = scheduleIssues.some((issue) => issue.severity === SEVERITY.INFO);
+		// Only surface the messages that match the dominant severity. Otherwise a
+		// blocking error tile would also list lower-severity notes (e.g. the
+		// info-level tier-mismatch), and consumers like the "Nie można przenieść"
+		// toast would show that info note as if it were the blocking reason.
+		const errorMessages = scheduleIssues
+			.filter((issue) => issue.severity === SEVERITY.ERROR)
+			.map((issue) => issue.message);
+		const warningMessages = scheduleIssues
+			.filter((issue) => issue.severity === SEVERITY.WARNING)
+			.map((issue) => issue.message);
+		const infoMessages = scheduleIssues
+			.filter((issue) => issue.severity === SEVERITY.INFO)
+			.map((issue) => issue.message);
 
-		if (hasError) {
+		if (errorMessages.length) {
 			return {
 				...ISSUE_COLORS.error,
 				kind: 'error',
-				messages: scheduleIssues.map((issue) => issue.message)
+				messages: errorMessages
 			};
 		}
-		if (hasWarning) {
+		if (warningMessages.length) {
 			return {
 				...ISSUE_COLORS.warning,
 				kind: 'warning',
-				messages: scheduleIssues.map((issue) => issue.message)
+				messages: warningMessages
 			};
 		}
-		if (hasInfo) {
+		if (infoMessages.length) {
 			return {
 				...ISSUE_COLORS.info,
 				kind: 'info',
-				messages: scheduleIssues.map((issue) => issue.message)
+				messages: infoMessages
 			};
 		}
 
@@ -514,7 +865,7 @@
 		for (const date of dates) {
 			const dayTimeSlots = timeSlots.filter((ts) => ts.date === date);
 			const daySchedules = hypotheticalSchedules.filter((s) =>
-				dayTimeSlots.some((ts) => ts.id === s.start_time_slot_id)
+				dayTimeSlots.some((ts) => ts.id === getScheduleStartSlotId(s))
 			);
 			if (!dayTimeSlots.length || !daySchedules.length) continue;
 			collectIssuesForDay(daySchedules, dayTimeSlots, result);
@@ -529,7 +880,7 @@
 	function getSchedulePlacement(schedule) {
 		return {
 			room_id: schedule.room_id,
-			start_time_slot_id: schedule.start_time_slot_id
+			start_time_slot_id: getScheduleStartSlotId(schedule)
 		};
 	}
 
@@ -628,9 +979,9 @@
 			rooms.findIndex((room) => room.id === placement.room_id)
 		);
 		const sameDate = currentSlot?.date === range.date;
+		const currentStartSlotId = getScheduleStartSlotId(schedule);
 		const currentRow = sameDate
-			? (hintIndexes.slotIndexByDate.get(range.date)?.get(schedule.start_time_slot_id) ??
-				range.startIdx)
+			? (hintIndexes.slotIndexByDate.get(range.date)?.get(currentStartSlotId) ?? range.startIdx)
 			: range.startIdx;
 		const score =
 			warningCount * 1000 +
@@ -701,9 +1052,31 @@
 				...schedule,
 				room_id: placement.room_id,
 				start_time_slot_id: placement.start_time_slot_id,
+				time_slot_id: placement.start_time_slot_id,
 				start_slot: startSlot ? { ...startSlot } : schedule.start_slot
 			};
 		});
+	}
+
+	function normalizeTags(value) {
+		if (Array.isArray(value)) return value.map((tag) => String(tag).trim()).filter(Boolean);
+		return String(value ?? '')
+			.split(/[,;\n]/)
+			.map((tag) => tag.trim())
+			.filter(Boolean);
+	}
+
+	function sharedTags(a, b) {
+		const right = new Set(normalizeTags(b).map((tag) => tag.toLowerCase()));
+		return normalizeTags(a).filter((tag) => right.has(tag.toLowerCase()));
+	}
+
+	function getScheduleConflictTags(schedule) {
+		return normalizeTags(schedule?.event?.conflict_tags ?? schedule?.person?.conflict_tags);
+	}
+
+	function getScheduleCoTags(schedule) {
+		return normalizeTags(schedule?.event?.co_schedule_tags ?? schedule?.person?.co_schedule_tags);
 	}
 
 	function buildChainMoves(assignments, scheduleById, sourceSchedule, targetSchedule) {
@@ -934,11 +1307,29 @@
 	}
 
 	function getEventSlotCount(event) {
+		if (isPeopleMode) return 1;
 		if (!convention?.slot_minutes) return 1;
 		return Math.ceil(event.duration_minutes / convention.slot_minutes);
 	}
 
 	function makeUnscheduledDragItem(event) {
+		if (isPeopleMode) {
+			return {
+				id: `person-${event.id}`,
+				isUnscheduled: true,
+				isPersonBlock: true,
+				personId: event.id,
+				eventId: event.id,
+				schedule: {
+					slot_count: 1,
+					event,
+					hosts: event.hosts,
+					host_name: event.host_name,
+					room_id: null,
+					start_time_slot_id: null
+				}
+			};
+		}
 		return {
 			id: `unscheduled-${event.id}`,
 			isUnscheduled: true,
@@ -962,6 +1353,7 @@
 		const slot = timeSlots.find((ts) => ts.id === startTimeSlotId);
 		sched.room_id = roomId;
 		sched.start_time_slot_id = startTimeSlotId;
+		if ('time_slot_id' in sched) sched.time_slot_id = startTimeSlotId;
 		if (slot) sched.start_slot = slot;
 	}
 
@@ -1090,7 +1482,7 @@
 		if (item.isUnscheduled) {
 			const day = daySections[target.dayIdx];
 			const daySchedules = hyp.filter((s) =>
-				day.timeSlots.some((ts) => ts.id === s.start_time_slot_id)
+				day.timeSlots.some((ts) => ts.id === getScheduleStartSlotId(s))
 			);
 			const existing = findOccupyingSchedules(
 				target.roomId,
@@ -1155,7 +1547,7 @@
 		const samePlace =
 			!item.isUnscheduled &&
 			item.schedule.room_id === target.roomId &&
-			item.schedule.start_time_slot_id === target.startTimeSlotId;
+			getScheduleStartSlotId(item.schedule) === target.startTimeSlotId;
 		if (samePlace) {
 			return getTileAppearance(item.id);
 		}
@@ -1197,7 +1589,7 @@
 		const samePlace =
 			!item.isUnscheduled &&
 			item.schedule.room_id === target.roomId &&
-			item.schedule.start_time_slot_id === target.startTimeSlotId;
+			getScheduleStartSlotId(item.schedule) === target.startTimeSlotId;
 		if (samePlace) {
 			return getTileAppearance(item.id);
 		}
@@ -1242,7 +1634,7 @@
 				.map((s) => ({
 					id: s.id,
 					schedule: s,
-					rowIdx: dayTimeSlots.findIndex((ts) => ts.id === s.start_time_slot_id)
+					rowIdx: dayTimeSlots.findIndex((ts) => ts.id === getScheduleStartSlotId(s))
 				}))
 				.filter((item) => item.rowIdx >= 0)
 		}));
@@ -1264,7 +1656,7 @@
 
 		const daySchedules = new Map();
 		for (const schedule of schedules) {
-			const date = schedule.start_slot?.date ?? slotById.get(schedule.start_time_slot_id)?.date;
+			const date = schedule.start_slot?.date ?? slotById.get(getScheduleStartSlotId(schedule))?.date;
 			if (!date) continue;
 			if (!daySchedules.has(date)) daySchedules.set(date, []);
 			daySchedules.get(date).push(schedule);
@@ -1293,28 +1685,31 @@
 
 	function collectIssuesForDay(daySchedules, dayTimeSlots, result) {
 		const personSlotMap = new Map();
-		const personScheduleSequence = new Map();
 		const roomSlotMap = new Map();
 		const roomScheduleSequence = new Map();
 
 		for (const sched of daySchedules) {
 			const hostIds = getHostIds(sched);
 			const slotIds = getSlotRange(sched, dayTimeSlots);
-			const startIdx = dayTimeSlots.findIndex((ts) => ts.id === sched.start_time_slot_id);
-			const eventTier = normalizeTier(sched.event?.tier, 2);
-			const slotTier = getScheduleSlotTier(sched);
-			if (Math.abs(eventTier - slotTier) > 0) {
-				pushIssue(result, {
-					severity: SEVERITY.INFO,
-					message: `Tier atrakcji T${eventTier} jest w slocie T${slotTier} (${sched.event.title})`,
-					scheduleId: sched.id
-				});
+			const startIdx = dayTimeSlots.findIndex((ts) => ts.id === getScheduleStartSlotId(sched));
+			// Slot popularity ("hype") tiers are an events-mode concept; people view
+			// has no hype, so the tier-vs-slot mismatch note must not be generated there.
+			if (!isPeopleMode) {
+				const eventTier = normalizeTier(sched.event?.tier, 2);
+				const slotTier = getScheduleSlotTier(sched);
+				if (Math.abs(eventTier - slotTier) > 0) {
+					pushIssue(result, {
+						severity: SEVERITY.INFO,
+						message: `Tier atrakcji T${eventTier} jest w slocie T${slotTier} (${sched.event.title})`,
+						scheduleId: sched.id
+					});
+				}
 			}
 
 			if (startIdx >= 0 && startIdx + sched.slot_count > dayTimeSlots.length) {
 				pushIssue(result, {
 					severity: SEVERITY.ERROR,
-					message: 'Za mało slotów w tym dniu',
+					message: 'Brak wystarczającej liczby terminów tego dnia',
 					scheduleId: sched.id
 				});
 			}
@@ -1324,6 +1719,29 @@
 			}
 
 			pushHostAvailabilityIssues(result, sched, slotIds);
+
+			if (isPeopleMode) {
+				const person = getSchedulePerson(sched);
+				const room = rooms.find((entry) => entry.id === sched.room_id);
+				const roomPreferenceTier = getPersonRoomPreferenceTier(person, room);
+				if (roomPreferenceTier === 3) {
+					pushIssue(result, {
+						severity: SEVERITY.ERROR,
+						code: 'room-tag-unwanted',
+						message: `${person?.display_name || 'Osoba'}: nie chce pracować w ${room?.name || 'tym stanowisku'}`,
+						scheduleId: sched.id,
+						personId: person?.id
+					});
+				} else if (roomPreferenceTier === 2) {
+					pushIssue(result, {
+						severity: SEVERITY.INFO,
+						code: 'room-tag-soft',
+						message: `${person?.display_name || 'Osoba'}: ${room?.name || 'stanowisko'} tylko jeśli będzie potrzeba`,
+						scheduleId: sched.id,
+						personId: person?.id
+					});
+				}
+			}
 
 			if (!roomSlotMap.has(sched.room_id)) roomSlotMap.set(sched.room_id, new Map());
 			if (!roomScheduleSequence.has(sched.room_id)) roomScheduleSequence.set(sched.room_id, []);
@@ -1353,7 +1771,6 @@
 
 			for (const hostId of hostIds) {
 				if (!personSlotMap.has(hostId)) personSlotMap.set(hostId, new Map());
-				if (!personScheduleSequence.has(hostId)) personScheduleSequence.set(hostId, []);
 
 				const hostSlots = personSlotMap.get(hostId);
 				for (const slotId of slotIds) {
@@ -1375,8 +1792,87 @@
 						hostSlots.set(slotId, sched);
 					}
 				}
+			}
+		}
 
-				personScheduleSequence.get(hostId).push({ sched, startIdx, roomId: sched.room_id });
+		for (let i = 0; i < daySchedules.length; i++) {
+			for (let j = i + 1; j < daySchedules.length; j++) {
+				const a = daySchedules[i];
+				const b = daySchedules[j];
+				const aSlots = getSlotRange(a, dayTimeSlots);
+				const bSlots = getSlotRange(b, dayTimeSlots);
+				const overlaps = aSlots.some((slotId) => bSlots.includes(slotId));
+				if (!overlaps) continue;
+				const conflictTags = sharedTags(getScheduleConflictTags(a), getScheduleConflictTags(b));
+				if (conflictTags.length) {
+					const message = `Konflikt tagów (${conflictTags.join(', ')})`;
+					pushIssue(result, {
+						severity: SEVERITY.ERROR,
+						code: 'tag-conflict',
+						message,
+						scheduleId: a.id
+					});
+					pushIssue(result, {
+						severity: SEVERITY.ERROR,
+						code: 'tag-conflict',
+						message,
+						scheduleId: b.id
+					});
+				}
+			}
+		}
+
+		const coTagged = daySchedules.filter((schedule) => getScheduleCoTags(schedule).length);
+		if (isPeopleMode) {
+			for (const schedule of coTagged) {
+				const missingTags = [];
+				const scheduleSlots = getSlotRange(schedule, dayTimeSlots);
+				for (const tag of getScheduleCoTags(schedule)) {
+					const tagKey = tag.toLowerCase();
+					const related = coTagged.filter(
+						(other) =>
+							other.id !== schedule.id &&
+							getScheduleCoTags(other).some((otherTag) => otherTag.toLowerCase() === tagKey)
+					);
+					if (!related.length) continue;
+					const hasSameSlotPartner = related.some((other) => {
+						const otherSlots = getSlotRange(other, dayTimeSlots);
+						return scheduleSlots.some((slotId) => otherSlots.includes(slotId));
+					});
+					if (!hasSameSlotPartner) missingTags.push(tag);
+				}
+				if (!missingTags.length) continue;
+				pushIssue(result, {
+					severity: SEVERITY.WARNING,
+					code: 'co-schedule-split',
+					message: `Powinny być w tym samym slocie (tag: ${missingTags.join(', ')})`,
+					scheduleId: schedule.id
+				});
+			}
+		} else {
+			for (let i = 0; i < coTagged.length; i++) {
+				for (let j = i + 1; j < coTagged.length; j++) {
+					const a = coTagged[i];
+					const b = coTagged[j];
+					const tags = sharedTags(getScheduleCoTags(a), getScheduleCoTags(b));
+					if (!tags.length) continue;
+					const aSlots = getSlotRange(a, dayTimeSlots);
+					const bSlots = getSlotRange(b, dayTimeSlots);
+					if (aSlots.some((slotId) => bSlots.includes(slotId))) continue;
+					const message = `Powinny być w tym samym slocie (tag: ${tags.join(', ')})`;
+					pushIssue(result, {
+						severity: SEVERITY.WARNING,
+						code: 'co-schedule-split',
+						message,
+						scheduleId: a.id
+					});
+					pushIssue(result, {
+						severity: SEVERITY.WARNING,
+						code: 'co-schedule-split',
+						message,
+						scheduleId: b.id
+					});
+				}
 			}
 		}
 
@@ -1404,60 +1900,6 @@
 				});
 			}
 		}
-
-		for (const [hostId, seq] of personScheduleSequence) {
-			const sorted = seq.sort((a, b) => a.startIdx - b.startIdx);
-			for (let i = 1; i < sorted.length; i++) {
-				const prev = sorted[i - 1];
-				const curr = sorted[i];
-				const prevEnd = prev.startIdx + prev.sched.slot_count;
-				if (curr.startIdx === prevEnd && prev.roomId !== curr.roomId) {
-					const prevRoom = rooms.find((r) => r.id === prev.roomId)?.name || '?';
-					const currRoom = rooms.find((r) => r.id === curr.roomId)?.name || '?';
-					const person = daySchedules
-						.find((s) => s.id === prev.sched.id)
-						?.hosts?.find((h) => h.id === hostId);
-					const message = `${person?.display_name || 'Prowadzący'}: ${prevRoom} → ${currRoom} bez przerwy`;
-					pushIssue(result, {
-						severity: SEVERITY.WARNING,
-						message,
-						scheduleId: prev.sched.id,
-						personId: hostId
-					});
-					pushIssue(result, {
-						severity: SEVERITY.WARNING,
-						message,
-						scheduleId: curr.sched.id,
-						personId: hostId
-					});
-				}
-			}
-
-			let runStart = 0;
-			let consecutive = sorted[0]?.sched.slot_count ?? 0;
-
-			for (let i = 1; i < sorted.length; i++) {
-				const prev = sorted[i - 1];
-				const curr = sorted[i];
-				const prevEnd = prev.startIdx + prev.sched.slot_count;
-
-				if (curr.startIdx === prevEnd) {
-					consecutive += curr.sched.slot_count;
-					continue;
-				}
-
-				if (consecutive >= 6) {
-					pushConsecutiveRunIssues(result, sorted, runStart, i - 1, hostId, consecutive);
-				}
-
-				runStart = i;
-				consecutive = curr.sched.slot_count;
-			}
-
-			if (consecutive >= 6) {
-				pushConsecutiveRunIssues(result, sorted, runStart, sorted.length - 1, hostId, consecutive);
-			}
-		}
 	}
 
 	const issues = $derived.by(() => {
@@ -1473,8 +1915,10 @@
 		}
 
 		return dedupeIssues(result).sort((a, b) => {
-			const order = { error: 0, warning: 1, info: 2 };
-			return order[a.severity] - order[b.severity];
+			const priorityA = a.priority ?? issuePriority(a.code, a.severity);
+			const priorityB = b.priority ?? issuePriority(b.code, b.severity);
+			if (priorityA !== priorityB) return priorityA - priorityB;
+			return String(a.message).localeCompare(String(b.message));
 		});
 	});
 
@@ -1486,13 +1930,24 @@
 	});
 
 	const issueSummary = $derived.by(() => {
-		const seen = new Set();
-		return issues.filter((issue) => {
+		const grouped = new Map();
+		for (const issue of issues) {
 			const key = `${issue.severity}|${issue.message}`;
-			if (seen.has(key)) return false;
-			seen.add(key);
-			return true;
-		});
+			if (!grouped.has(key)) {
+				grouped.set(key, {
+					...issue,
+					key,
+					scheduleIds: issue.scheduleId ? [issue.scheduleId] : []
+				});
+				continue;
+			}
+
+			const summary = grouped.get(key);
+			if (issue.scheduleId && !summary.scheduleIds.includes(issue.scheduleId)) {
+				summary.scheduleIds = [...summary.scheduleIds, issue.scheduleId];
+			}
+		}
+		return [...grouped.values()];
 	});
 
 	const errorCount = $derived(issueSummary.filter((i) => i.severity === SEVERITY.ERROR).length);
@@ -1507,6 +1962,93 @@
 			return true;
 		})
 	);
+
+	const issueFocusActive = $derived(highlightedIssueScheduleIds.size > 0);
+
+	function clearIssueFocus() {
+		highlightedIssueScheduleIds = new Set();
+		highlightedIssueKey = '';
+		highlightedIssueSeverity = null;
+		highlightedIssueRoomId = null;
+		highlightedIssueSlotIds = new Set();
+	}
+
+	function dismissIssueFocusOnClick(event) {
+		if (!issueFocusActive) return false;
+		event?.stopPropagation?.();
+		clearIssueFocus();
+		return true;
+	}
+
+	function buildIssueFocusContext(scheduleIds) {
+		const slotIds = new Set();
+		let roomId = null;
+		for (const scheduleId of scheduleIds) {
+			const sched = schedules.find((entry) => entry.id === scheduleId);
+			if (!sched) continue;
+			roomId ??= sched.room_id;
+			for (const slotId of getSlotRange(sched)) slotIds.add(slotId);
+		}
+		return { slotIds, roomId };
+	}
+
+	function scrollScheduleIntoView(element) {
+		if (!element) return;
+		const scrollEl = getDropTargetScrollEl();
+		if (!scrollEl) {
+			element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+			return;
+		}
+
+		const scrollRect = scrollEl.getBoundingClientRect();
+		const elementRect = element.getBoundingClientRect();
+		const top =
+			elementRect.top - scrollRect.top + scrollEl.scrollTop - scrollEl.clientHeight / 2 + elementRect.height / 2;
+		const left =
+			elementRect.left - scrollRect.left + scrollEl.scrollLeft - scrollEl.clientWidth / 2 + elementRect.width / 2;
+
+		scrollEl.scrollTo({
+			top: Math.max(0, top),
+			left: Math.max(0, left),
+			behavior: 'smooth'
+		});
+	}
+
+	function findScheduleElement(scheduleId) {
+		return [...document.querySelectorAll('.sheet-event[data-schedule-id]')].find(
+			(element) => element.getAttribute('data-schedule-id') === scheduleId
+		);
+	}
+
+	async function highlightIssueSchedules(event, issue) {
+		event.stopPropagation();
+		const scheduleIds = issue.scheduleIds?.length
+			? issue.scheduleIds
+			: issue.scheduleId
+				? [issue.scheduleId]
+				: [];
+		if (scheduleIds.length === 0) return;
+
+		closeEventPanel();
+		selectedSlot = null;
+		selectedSchedule = null;
+		highlightedIssueKey = issue.key ?? issueKey(issue);
+		highlightedIssueSeverity = issue.severity ?? null;
+
+		const focusContext = buildIssueFocusContext(scheduleIds);
+		highlightedIssueRoomId = focusContext.roomId;
+		highlightedIssueSlotIds = focusContext.slotIds;
+
+		// Reset then re-apply so the pulse animation retriggers on repeated clicks.
+		highlightedIssueScheduleIds = new Set();
+		await tick();
+		highlightedIssueScheduleIds = new Set(scheduleIds);
+		await tick();
+
+		const target = findScheduleElement(scheduleIds[0]);
+		scrollScheduleIntoView(target);
+		target?.focus({ preventScroll: true });
+	}
 
 	function hintSeverityRank(kind) {
 		if (kind === 'error') return 3;
@@ -1526,9 +2068,9 @@
 
 	function overlapsRange(schedule, dayTimeSlots, startRow, slotCount) {
 		const slotIndex = hintIndexes.slotIndexByDate.get(dayTimeSlots[0]?.date) ?? new Map();
+		const startSlotId = getScheduleStartSlotId(schedule);
 		const scheduleStart =
-			slotIndex.get(schedule.start_time_slot_id) ??
-			dayTimeSlots.findIndex((ts) => ts.id === schedule.start_time_slot_id);
+			slotIndex.get(startSlotId) ?? dayTimeSlots.findIndex((ts) => ts.id === startSlotId);
 		if (scheduleStart < 0) return false;
 		const scheduleEnd = scheduleStart + schedule.slot_count - 1;
 		const targetEnd = startRow + slotCount - 1;
@@ -1537,6 +2079,33 @@
 
 	function schedulesShareHost(schedule, hostIds) {
 		return schedule.hosts?.some((host) => hostIds.has(host.id));
+	}
+
+	function buildPreviewSchedule(hostIds, roomId, startTimeSlotId, slotCount, event) {
+		const firstHostId = [...hostIds][0] ?? event?.person?.id ?? event?.id;
+		const person = event?.person ?? people.find((entry) => entry.id === firstHostId) ?? null;
+		const title = event?.title ?? person?.display_name ?? 'Podgląd';
+		return {
+			id: PREVIEW_SCHEDULE_ID,
+			person_id: person?.id ?? firstHostId,
+			room_id: roomId,
+			time_slot_id: startTimeSlotId,
+			start_time_slot_id: startTimeSlotId,
+			slot_count: slotCount,
+			person,
+			event: {
+				...(event || {}),
+				id: event?.id ?? person?.id ?? PREVIEW_SCHEDULE_ID,
+				title,
+				conflict_tags: event?.conflict_tags ?? person?.conflict_tags ?? [],
+				co_schedule_tags: event?.co_schedule_tags ?? person?.co_schedule_tags ?? []
+			},
+			hosts: [...hostIds].map((hostId) => {
+				const host = people.find((entry) => entry.id === hostId);
+				return { id: hostId, display_name: host?.display_name ?? title };
+			}),
+			host_name: person?.display_name ?? title
+		};
 	}
 
 	function evaluateScheduleAt(
@@ -1551,11 +2120,10 @@
 	) {
 		const slotBlock = day.timeSlots.slice(startRow, startRow + slotCount);
 		const slotIds = slotBlock.map((slot) => slot.id);
-		const slotIndex = hintIndexes.slotIndexByDate.get(day.date) ?? new Map();
 
 		if (slotBlock.length < slotCount) {
 			return appearanceFromIssues(
-				[{ severity: SEVERITY.ERROR, message: 'Za mało slotów w tym dniu' }],
+				[{ severity: SEVERITY.ERROR, message: 'Brak wystarczającej liczby terminów tego dnia' }],
 				1
 			);
 		}
@@ -1567,118 +2135,24 @@
 			}
 		}
 
-		if (event) {
-			const roomFitIssues = getRoomFitIssues({ id: PREVIEW_SCHEDULE_ID, event }, roomId);
-			if (roomFitIssues.length > 0) {
-				return appearanceFromIssues(roomFitIssues, worstTier);
-			}
-		}
+		const preview = buildPreviewSchedule(hostIds, roomId, slotBlock[0].id, slotCount, event);
+		const hypotheticalDaySchedules = [
+			...daySchedules.filter((schedule) => !ignoredIds.has(schedule.id)),
+			preview
+		];
+		const hypotheticalIssues = [];
+		collectIssuesForDay(hypotheticalDaySchedules, day.timeSlots, hypotheticalIssues);
+		const previewIssues = dedupeIssues(hypotheticalIssues).filter(
+			(issue) => issue.scheduleId === PREVIEW_SCHEDULE_ID
+		);
 
-		for (const schedule of daySchedules) {
-			if (ignoredIds.has(schedule.id)) continue;
-			if (schedule.room_id === roomId && overlapsRange(schedule, day.timeSlots, startRow, slotCount)) {
-				return appearanceFromIssues(
-					[{ severity: SEVERITY.ERROR, message: `Sala zajęta — konflikt z „${schedule.event.title}"` }],
-					worstTier
-				);
-			}
-		}
-
-		for (const schedule of daySchedules) {
-			if (ignoredIds.has(schedule.id) || !schedulesShareHost(schedule, hostIds)) continue;
-			if (overlapsRange(schedule, day.timeSlots, startRow, slotCount)) {
-				return appearanceFromIssues(
-					[{ severity: SEVERITY.ERROR, message: `Konflikt czasu z „${schedule.event.title}"` }],
-					worstTier
-				);
-			}
-		}
-
-		if (worstTier === 3) {
-			return appearanceFromIssues(
-				[{ severity: SEVERITY.ERROR, message: 'Prowadzący niedostępny w tym czasie' }],
-				worstTier,
-				{ useAvailabilityFallback: true }
-			);
-		}
-
-		const warnings = [];
-		const targetEnd = startRow + slotCount;
-		for (const hostId of hostIds) {
-			const sequence = daySchedules
-				.filter(
-					(schedule) => !ignoredIds.has(schedule.id) && schedule.hosts?.some((host) => host.id === hostId)
-				)
-				.map((schedule) => ({
-					startIdx:
-						slotIndex.get(schedule.start_time_slot_id) ??
-						day.timeSlots.findIndex((slot) => slot.id === schedule.start_time_slot_id),
-					slotCount: schedule.slot_count,
-					roomId: schedule.room_id,
-					isPreview: false
-				}))
-				.filter((entry) => entry.startIdx >= 0);
-
-			sequence.push({
-				startIdx: startRow,
-				slotCount,
-				roomId,
-				isPreview: true
-			});
-			sequence.sort((a, b) => a.startIdx - b.startIdx);
-
-			for (let i = 1; i < sequence.length; i++) {
-				const prev = sequence[i - 1];
-				const curr = sequence[i];
-				const prevEnd = prev.startIdx + prev.slotCount;
-				if ((prev.isPreview || curr.isPreview) && curr.startIdx === prevEnd && prev.roomId !== curr.roomId) {
-					warnings.push({
-						severity: SEVERITY.WARNING,
-						message: 'Zmiana sali bez przerwy'
-					});
-					break;
-				}
-			}
-
-			let runStart = startRow;
-			let runEnd = targetEnd;
-			let expanded = true;
-			while (expanded) {
-				expanded = false;
-				for (const entry of sequence) {
-					if (entry.startIdx === runEnd) {
-						runEnd += entry.slotCount;
-						expanded = true;
-					} else if (entry.startIdx + entry.slotCount === runStart) {
-						runStart = entry.startIdx;
-						expanded = true;
-					}
-				}
-			}
-			if (runEnd - runStart >= 6) {
-				warnings.push({
-					severity: SEVERITY.WARNING,
-					message: '6+ slotów bez przerwy'
-				});
-			}
-		}
-
-		if (worstTier === 2) {
-			warnings.push({
-				severity: SEVERITY.WARNING,
-				message: 'Prowadzący woli nie w tym czasie'
-			});
-		}
-
-		return appearanceFromIssues(warnings, worstTier, { useAvailabilityFallback: true });
+		return appearanceFromIssues(previewIssues, worstTier, { useAvailabilityFallback: true });
 	}
 
 	function getScheduleStartRow(schedule, day) {
 		const slotIndex = hintIndexes.slotIndexByDate.get(day.date) ?? new Map();
-		return (
-			slotIndex.get(schedule.start_time_slot_id) ??
-			day.timeSlots.findIndex((slot) => slot.id === schedule.start_time_slot_id)
-		);
+		const startSlotId = getScheduleStartSlotId(schedule);
+		return slotIndex.get(startSlotId) ?? day.timeSlots.findIndex((slot) => slot.id === startSlotId);
 	}
 
 	function getSwapPreviewAppearance(item, existing, day, daySchedules) {
@@ -1775,7 +2249,6 @@
 	function computePlacementHintsForItem(item) {
 		const slotCount = item.schedule.slot_count;
 		const rawCells = new Map();
-		const swaps = new Map();
 
 		for (let dayIdx = 0; dayIdx < daySections.length; dayIdx++) {
 			const day = daySections[dayIdx];
@@ -1806,26 +2279,6 @@
 					);
 
 					if (existing) {
-						if (item.isUnscheduled) {
-							swaps.set(
-								existing.id,
-								getFastPlacementAppearance(item, target, day, daySchedules, existing)
-							);
-						} else {
-							const appearance =
-								getDirectDropPlanAppearance(item, target) ??
-								getSwapPreviewAppearance(item, existing, day, daySchedules);
-							for (const overlap of findOccupyingSchedules(
-								roomId,
-								startRow,
-								slotCount,
-								daySchedules,
-								day.timeSlots,
-								item.id
-							)) {
-								swaps.set(overlap.id, mergePlacementHint(swaps.get(overlap.id), appearance));
-							}
-						}
 						continue;
 					}
 
@@ -1856,12 +2309,196 @@
 			});
 		}
 
-		return { cells, swaps };
+		return { cells, swaps: new Map() };
+	}
+
+	function rectCenter(rect) {
+		return {
+			x: rect.left + rect.width / 2,
+			y: rect.top + rect.height / 2
+		};
+	}
+
+	function isVisibleRect(rect) {
+		return (
+			rect.width > 0 &&
+			rect.height > 0 &&
+			rect.bottom >= 0 &&
+			rect.right >= 0 &&
+			rect.top <= window.innerHeight &&
+			rect.left <= window.innerWidth
+		);
+	}
+
+	function getScheduleDropTarget(schedule) {
+		const startSlotId = getScheduleStartSlotId(schedule);
+		const slot = schedule.start_slot ?? hintIndexes.slotById.get(startSlotId);
+		if (!slot) return null;
+		const dayIdx = daySections.findIndex((day) => day.date === slot.date);
+		if (dayIdx < 0) return null;
+		const day = daySections[dayIdx];
+		const colIdx = day.roomColumnItems.findIndex((col) => col.room.id === schedule.room_id);
+		if (colIdx < 0) return null;
+		const slotIndex = hintIndexes.slotIndexByDate.get(slot.date) ?? new Map();
+		const rowIdx =
+			slotIndex.get(startSlotId) ?? day.timeSlots.findIndex((entry) => entry.id === startSlotId);
+		if (rowIdx < 0) return null;
+		return {
+			dayIdx,
+			colIdx,
+			rowIdx,
+			roomId: schedule.room_id,
+			startTimeSlotId: startSlotId
+		};
+	}
+
+	function normalizeSwapAppearance(appearance) {
+		if (appearance?.kind === 'info') {
+			return {
+				...OK_TILE_COLORS,
+				kind: 'ok',
+				messages: appearance.messages || []
+			};
+		}
+		return appearance;
+	}
+
+	function computeSwapHintForSchedule(item, targetSchedule) {
+		if (targetSchedule?.locked) return lockedMoveAppearance(targetSchedule);
+		const target = getScheduleDropTarget(targetSchedule);
+		if (!target) return PENDING_SWAP_COLORS;
+		const day = daySections[target.dayIdx];
+		const daySchedules = hintIndexes.daySchedules.get(day.date) ?? [];
+		if (item.isUnscheduled) {
+			return normalizeSwapAppearance(
+				getFastPlacementAppearance(item, target, day, daySchedules, targetSchedule)
+			);
+		}
+		return normalizeSwapAppearance(
+			getDirectDropPlanAppearance(item, target) ??
+				getSwapPreviewAppearance(item, targetSchedule, day, daySchedules)
+		);
+	}
+
+	function collectSwapTargetSchedules(item) {
+		return schedules.filter((schedule) => schedule.id !== item.id);
+	}
+
+	function collectVisibleSwapTargets(item) {
+		const sourceEl = document.querySelector(`[data-schedule-id="${item.id}"]`);
+		const sourceRect = sourceEl?.getBoundingClientRect();
+		const sourceCenter = sourceRect && isVisibleRect(sourceRect) ? rectCenter(sourceRect) : null;
+		const fallbackCenter = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+		const center = sourceCenter ?? fallbackCenter;
+		const seen = new Set();
+		return [...document.querySelectorAll('.sheet-event[data-schedule-id]')]
+			.map((el) => {
+				const id = el.getAttribute('data-schedule-id');
+				if (!id || id === item.id || seen.has(id)) return null;
+				seen.add(id);
+				const schedule = schedules.find((entry) => entry.id === id);
+				if (!schedule) return null;
+				const rect = el.getBoundingClientRect();
+				if (!isVisibleRect(rect)) return null;
+				const targetCenter = rectCenter(rect);
+				return {
+					id,
+					schedule,
+					distance: Math.hypot(targetCenter.x - center.x, targetCenter.y - center.y)
+				};
+			})
+			.filter(Boolean)
+			.sort((a, b) => a.distance - b.distance);
+	}
+
+	function cancelProgressiveSwapWork() {
+		if (progressiveSwapFrame !== null) {
+			cancelAnimationFrame(progressiveSwapFrame);
+			progressiveSwapFrame = null;
+		}
+		if (progressiveSwapScrollFrame !== null) {
+			cancelAnimationFrame(progressiveSwapScrollFrame);
+			progressiveSwapScrollFrame = null;
+		}
+		progressiveSwapItem = null;
+		progressiveSwapQueue = [];
+		progressiveQueuedSwapIds = new Set();
+		progressiveComputedSwapIds = new Set();
+	}
+
+	function runProgressiveSwapBatch(item, token) {
+		if (token !== hintComputeToken || item !== progressiveSwapItem) return;
+		const nextSwaps = new Map(placementHints.swaps);
+		const batchSize = 4;
+		let processed = 0;
+
+		while (progressiveSwapQueue.length > 0 && processed < batchSize) {
+			const target = progressiveSwapQueue.shift();
+			progressiveQueuedSwapIds.delete(target.id);
+			if (progressiveComputedSwapIds.has(target.id)) continue;
+			nextSwaps.set(target.id, computeSwapHintForSchedule(item, target.schedule));
+			progressiveComputedSwapIds.add(target.id);
+			processed++;
+		}
+
+		if (processed > 0) {
+			placementHints = { ...placementHints, swaps: nextSwaps };
+		}
+
+		if (progressiveSwapQueue.length > 0) {
+			progressiveSwapFrame = requestAnimationFrame(() => runProgressiveSwapBatch(item, token));
+		} else {
+			progressiveSwapFrame = null;
+		}
+	}
+
+	function queueVisibleSwapTargets(item, token) {
+		if (token !== hintComputeToken || item !== progressiveSwapItem) return;
+		let queuedAny = false;
+
+		for (const target of collectVisibleSwapTargets(item)) {
+			if (progressiveComputedSwapIds.has(target.id) || progressiveQueuedSwapIds.has(target.id)) continue;
+			progressiveSwapQueue.push(target);
+			progressiveQueuedSwapIds.add(target.id);
+			queuedAny = true;
+		}
+
+		if (queuedAny && progressiveSwapFrame === null) {
+			progressiveSwapFrame = requestAnimationFrame(() => runProgressiveSwapBatch(item, token));
+		}
+	}
+
+	function scheduleVisibleSwapTargetRefresh() {
+		if (!progressiveSwapItem || progressiveSwapScrollFrame !== null) return;
+		const item = progressiveSwapItem;
+		const token = hintComputeToken;
+		progressiveSwapScrollFrame = requestAnimationFrame(() => {
+			progressiveSwapScrollFrame = null;
+			queueVisibleSwapTargets(item, token);
+		});
+	}
+
+	function startProgressiveSwapHints(item, token) {
+		cancelProgressiveSwapWork();
+		progressiveSwapItem = item;
+
+		const targets = collectSwapTargetSchedules(item);
+		if (targets.length === 0) {
+			progressiveSwapItem = null;
+			return;
+		}
+		const pendingSwaps = new Map(placementHints.swaps);
+		for (const target of targets) pendingSwaps.set(target.id, PENDING_SWAP_COLORS);
+		placementHints = { ...placementHints, swaps: pendingSwaps };
+
+		queueVisibleSwapTargets(item, token);
 	}
 
 	function computeAndApplyHints(item) {
+		hintComputeToken++;
 		const result = computePlacementHintsForItem(item);
 		placementHints = result;
+		startProgressiveSwapHints(item, hintComputeToken);
 	}
 
 	function scheduleDropPreview(clientX, clientY) {
@@ -1877,9 +2514,20 @@
 	}
 
 	function onDragScroll() {
+		scheduleVisibleSwapTargetRefresh();
 		if (!dragState?.moved || !pendingPreviewCoords) return;
 		scheduleDropPreview(pendingPreviewCoords.clientX, pendingPreviewCoords.clientY);
 	}
+
+	$effect(() => {
+		const scrollEl = sheetScrollEl;
+		const shouldRefreshSelectedHints =
+			Boolean(selectedSchedule || selectedUnscheduledEvent) && !dragState?.moved;
+		if (!scrollEl || !shouldRefreshSelectedHints) return;
+
+		scrollEl.addEventListener('scroll', scheduleVisibleSwapTargetRefresh, { passive: true });
+		return () => scrollEl.removeEventListener('scroll', scheduleVisibleSwapTargetRefresh);
+	});
 
 	function attachDragWindowListeners() {
 		window.addEventListener('pointermove', onWindowPointerMove);
@@ -1901,6 +2549,8 @@
 	}
 
 	function clearActiveDragState() {
+		hintComputeToken++;
+		cancelProgressiveSwapWork();
 		detachDragWindowListeners();
 		if (dropPreviewFrame !== null) {
 			cancelAnimationFrame(dropPreviewFrame);
@@ -1939,18 +2589,25 @@
 
 	async function loadSchedule(options = {}) {
 		if (!convention) return;
-		const [roomsData, slotsData, schedulesData, unscheduledData, availData] = await Promise.all([
-			getRooms(convention.id),
-			getTimeSlots(convention.id),
-			getSchedules(convention.id),
-			getUnscheduledEvents(convention.id),
-			getAvailability(convention.id)
-		]);
+		const [roomsData, slotsData, schedulesData, unscheduledData, availData, peopleData, hoursData, undoData] =
+			await Promise.all([
+				getRooms(convention.id),
+				getTimeSlots(convention.id),
+				isPeopleMode ? getPeopleSchedules(convention.id) : getSchedules(convention.id),
+				isPeopleMode ? Promise.resolve([]) : getUnscheduledEvents(convention.id),
+				getAvailability(convention.id),
+				getPeople(convention.id),
+				getPersonHours(convention.id),
+				getUndoHistory(convention.id)
+			]);
 		rooms = roomsData;
 		timeSlots = slotsData;
 		schedules = schedulesData;
 		unscheduled = unscheduledData;
 		availability = availData;
+		people = peopleData;
+		personHours = hoursData;
+		undoHistory = undoData;
 		rebuildHintIndexes();
 		buildDaySections();
 
@@ -1965,6 +2622,19 @@
 			if (!selectedUnscheduledEvent) closeEventPanel();
 		}
 
+		if (highlightedIssueScheduleIds.size > 0) {
+			const existingIds = new Set(schedules.map((schedule) => schedule.id));
+			const remainingIds = [...highlightedIssueScheduleIds].filter((id) => existingIds.has(id));
+			if (remainingIds.length === 0) {
+				clearIssueFocus();
+			} else {
+				highlightedIssueScheduleIds = new Set(remainingIds);
+				const focusContext = buildIssueFocusContext(remainingIds);
+				highlightedIssueRoomId = focusContext.roomId;
+				highlightedIssueSlotIds = focusContext.slotIds;
+			}
+		}
+
 		if (
 			chainSwap.sourceScheduleId &&
 			!schedules.some((schedule) => schedule.id === chainSwap.sourceScheduleId)
@@ -1974,22 +2644,89 @@
 	}
 
 	function openEventPanel(schedule, anchorEl) {
+		clearAllHighlights();
 		selectedUnscheduledEvent = null;
 		selectedSchedule = schedule;
 		panelAnchorRect = anchorEl.getBoundingClientRect();
 	}
 
 	function openUnscheduledPanel(event, anchorEl) {
+		clearAllHighlights();
 		selectedSchedule = null;
 		selectedUnscheduledEvent = event;
 		panelAnchorRect = anchorEl.getBoundingClientRect();
 	}
 
-	function closeEventPanel() {
+	function closeEventPanel(options = {}) {
+		if (options.clearHints !== false) clearPlacementHints();
 		selectedSchedule = null;
 		selectedUnscheduledEvent = null;
 		panelAnchorRect = null;
 	}
+
+	function clearPlacementHints() {
+		hintComputeToken++;
+		cancelProgressiveSwapWork();
+		placementHints = { cells: new Map(), swaps: new Map() };
+	}
+
+	function clearAllHighlights() {
+		clearPlacementHints();
+		selectedSlot = null;
+		clearIssueFocus();
+	}
+
+	// Drops the "check availability" selection: clears the highlighted tile, the
+	// placement hints painted across the grid, and any open detail panel.
+	function clearSelectionHighlight() {
+		clearAllHighlights();
+		closeEventPanel({ clearHints: false });
+	}
+
+	function handleOutsideSelectionClick(event) {
+		// A click that ends a drag is consumed by blockNextClick; don't treat it as
+		// an outside click that cancels the selection.
+		if (blockNextClick || dragState?.moved) {
+			blockNextClick = false;
+			return;
+		}
+		// Clicks on a tile/sidebar item are handled by their own click handlers
+		// (which stop propagation); panel clicks must not dismiss the panel.
+		if (event.target.closest?.('.sheet-event, .sheet-sidebar-item, .event-panel')) return;
+		clearSelectionHighlight();
+	}
+
+	// While a person/event is selected for availability checking, a click anywhere
+	// else cancels it. The tile/sidebar click handlers call stopPropagation, so
+	// this only ever fires for clicks outside the selected item.
+	$effect(() => {
+		if (!selectedSchedule && !selectedUnscheduledEvent) return;
+		window.addEventListener('click', handleOutsideSelectionClick);
+		return () => window.removeEventListener('click', handleOutsideSelectionClick);
+	});
+
+	function handleIssueFocusOutsideClick(event) {
+		if (!issueFocusActive) return;
+		if (blockNextClick || dragState?.moved) {
+			blockNextClick = false;
+			return;
+		}
+		// Interactive targets handle dismiss themselves and stop propagation.
+		if (
+			event.target.closest?.(
+				'.sheet-issue, .sheet-event, .sheet-sidebar-item, .sheet-row-label, .sheet-col-header'
+			)
+		) {
+			return;
+		}
+		clearIssueFocus();
+	}
+
+	$effect(() => {
+		if (!issueFocusActive) return;
+		window.addEventListener('click', handleIssueFocusOutsideClick);
+		return () => window.removeEventListener('click', handleIssueFocusOutsideClick);
+	});
 
 	function resetChainSwap() {
 		chainSwap = {
@@ -2117,11 +2854,21 @@
 		}
 		chainSwap = { ...chainSwap, applying: true };
 		try {
-			for (const move of option.moves) {
-				await updateSchedule(move.scheduleId, {
-					room_id: move.to.room_id,
-					start_time_slot_id: move.to.start_time_slot_id
-				});
+			if (isPeopleMode) {
+				await movePeopleSchedules(
+					option.moves.map((move) => ({
+						scheduleId: move.scheduleId,
+						room_id: move.to.room_id,
+						time_slot_id: move.to.start_time_slot_id
+					}))
+				);
+			} else {
+				for (const move of option.moves) {
+					await updateSchedule(move.scheduleId, {
+						room_id: move.to.room_id,
+						start_time_slot_id: move.to.start_time_slot_id
+					});
+				}
 			}
 			toast.success('Zastosowano sekwencję zamian', {
 				description: `${option.moves.length} ruchów`
@@ -2140,6 +2887,18 @@
 			return;
 		}
 		event.stopPropagation();
+		if (dismissIssueFocusOnClick(event)) return;
+		selectedSchedule = null;
+		selectedUnscheduledEvent = unscheduledEvent;
+		computeAndApplyHints(makeUnscheduledDragItem(unscheduledEvent));
+	}
+
+	function handleUnscheduledDoubleClick(event, unscheduledEvent, anchorEl) {
+		if (blockNextClick || dragState?.moved) {
+			blockNextClick = false;
+			return;
+		}
+		event.stopPropagation();
 		openUnscheduledPanel(unscheduledEvent, anchorEl);
 	}
 
@@ -2151,13 +2910,26 @@
 		event.stopPropagation();
 		if (chainSwap.mode === 'selecting') {
 			if (schedule.id === chainSwap.sourceScheduleId) {
-				toast.error('Wybierz inną atrakcję jako docelowe miejsce');
+				toast.error('Wybierz inny wpis jako docelowe miejsce');
 				return;
 			}
 			computeChainSwapForTarget(schedule);
 			return;
 		}
 		// While planning / previewing chain swaps the grid is read-only.
+		if (chainSwap.mode !== 'idle') return;
+		if (dismissIssueFocusOnClick(event)) return;
+		selectedSchedule = schedule;
+		selectedUnscheduledEvent = null;
+		computeAndApplyHints({ id: schedule.id, schedule });
+	}
+
+	function handleEventDoubleClick(event, schedule, anchorEl) {
+		if (blockNextClick || dragState?.moved) {
+			blockNextClick = false;
+			return;
+		}
+		event.stopPropagation();
 		if (chainSwap.mode !== 'idle') return;
 		openEventPanel(schedule, anchorEl);
 	}
@@ -2290,8 +3062,8 @@
 			.map((schedule) => ({
 				schedule,
 				startIdx:
-					slotIndex.get(schedule.start_time_slot_id) ??
-					dayTimeSlots.findIndex((ts) => ts.id === schedule.start_time_slot_id)
+					slotIndex.get(getScheduleStartSlotId(schedule)) ??
+					dayTimeSlots.findIndex((ts) => ts.id === getScheduleStartSlotId(schedule))
 			}))
 			.filter(({ schedule, startIdx }) => {
 				if (schedule.id === excludeId || schedule.room_id !== roomId || startIdx < 0) return false;
@@ -2323,31 +3095,39 @@
 		const daySchedules = hintIndexes.daySchedules.get(day.date) ?? [];
 
 		if (item.isUnscheduled) {
-			const existing = findOccupyingSchedules(
-				commitTarget.roomId,
-				commitTarget.rowIdx,
-				schedule.slot_count,
-				daySchedules,
-				day.timeSlots,
-				null
-			);
+			if (isPeopleMode) {
+				await createPeopleSchedule({
+					person_id: item.personId,
+					room_id: commitTarget.roomId,
+					time_slot_id: commitTarget.startTimeSlotId
+				});
+			} else {
+				const existing = findOccupyingSchedules(
+					commitTarget.roomId,
+					commitTarget.rowIdx,
+					schedule.slot_count,
+					daySchedules,
+					day.timeSlots,
+					null
+				);
 
-			for (const schedule of existing) {
-				await deleteSchedule(schedule.id);
+				for (const schedule of existing) {
+					await deleteSchedule(schedule.id);
+				}
+
+				await createSchedule({
+					event_id: item.eventId,
+					room_id: commitTarget.roomId,
+					start_time_slot_id: commitTarget.startTimeSlotId,
+					slot_count: schedule.slot_count
+				});
 			}
-
-			await createSchedule({
-				event_id: item.eventId,
-				room_id: commitTarget.roomId,
-				start_time_slot_id: commitTarget.startTimeSlotId,
-				slot_count: schedule.slot_count
-			});
 			return;
 		}
 
 		const samePlace =
 			schedule.room_id === commitTarget.roomId &&
-			schedule.start_time_slot_id === commitTarget.startTimeSlotId;
+			getScheduleStartSlotId(schedule) === commitTarget.startTimeSlotId;
 		if (samePlace) return;
 
 		const dropAppearance = getDropPreviewAppearance(item, commitTarget);
@@ -2359,6 +3139,21 @@
 		}
 
 		if (plan) {
+			if (isPeopleMode) {
+				// People schedules live in a separate table and reject moving onto an
+				// occupied cell, so a swap (dragged item + one displaced item) has to be
+				// applied atomically; a plain move targets an empty cell.
+				const [primary, ...displaced] = plan.moves;
+				if (displaced.length === 1) {
+					await swapPeopleSchedules(primary.scheduleId, displaced[0].scheduleId);
+				} else {
+					await updatePeopleSchedule(primary.scheduleId, {
+						room_id: primary.roomId,
+						time_slot_id: primary.startTimeSlotId
+					});
+				}
+				return;
+			}
 			for (const move of plan.moves) {
 				await updateSchedule(move.scheduleId, {
 					room_id: move.roomId,
@@ -2368,10 +3163,17 @@
 			return;
 		}
 
-		await updateSchedule(item.id, {
-			room_id: commitTarget.roomId,
-			start_time_slot_id: commitTarget.startTimeSlotId
-		});
+		if (isPeopleMode) {
+			await updatePeopleSchedule(item.id, {
+				room_id: commitTarget.roomId,
+				time_slot_id: commitTarget.startTimeSlotId
+			});
+		} else {
+			await updateSchedule(item.id, {
+				room_id: commitTarget.roomId,
+				start_time_slot_id: commitTarget.startTimeSlotId
+			});
+		}
 	}
 
 	function beginDrag(event, item, meta = {}) {
@@ -2456,7 +3258,11 @@
 
 	async function handleDeleteSchedule(scheduleId) {
 		try {
-			await deleteSchedule(scheduleId);
+			if (isPeopleMode) {
+				await deletePeopleSchedule(scheduleId);
+			} else {
+				await deleteSchedule(scheduleId);
+			}
 			toast.success('Usunięto z grafiku');
 			await loadSchedule();
 		} catch (error) {
@@ -2469,7 +3275,7 @@
 		if (total === 0) return;
 
 		autoScheduling = true;
-		autoScheduleProgress = { current: 0, total, phase: 'Przebudowa grafiku...' };
+		autoScheduleProgress = { current: 0, total, phase: 'Przeliczam grafik…' };
 		closeEventPanel();
 		await flushUi();
 
@@ -2487,11 +3293,11 @@
 			await flushUi();
 			await loadSchedule();
 
-			toast.success('Auto-grafik gotowy', {
-				description: `${result.successes.length} zaplanowano, ${result.errors.length} niezaplanowanych`
+			toast.success('Grafik ułożony', {
+				description: `${result.successes.length} zaplanowano, ${result.errors.length} nie udało się zaplanować`
 			});
 		} catch (error) {
-			toast.error('Auto-grafik nieudany', { description: error.message });
+			toast.error('Nie udało się ułożyć grafiku', { description: error.message });
 		} finally {
 			autoScheduling = false;
 			autoScheduleProgress = { current: 0, total: 0, phase: '' };
@@ -2502,7 +3308,7 @@
 		if (!convention || schedules.length === 0) return;
 		if (
 			!confirm(
-				`Usunąć wszystkie ${schedules.length} atrakcje z grafiku? Wrócą na listę niezaplanowanych.`
+				`Usunąć wszystkie ${schedules.length} ${isPeopleMode ? 'wpisy osób' : 'atrakcje'} z grafiku?`
 			)
 		) {
 			return;
@@ -2511,14 +3317,28 @@
 			const { removed } = await clearAllSchedules(convention.id);
 			closeEventPanel();
 			toast.success('Grafik wyczyszczony', {
-				description: `${removed} atrakcji przeniesiono do niezaplanowanych`
+				description: `${removed} wpisów usunięto z grafiku`
 			});
 			await loadSchedule();
 		} catch (error) {
 			toast.error('Błąd czyszczenia grafiku', { description: error.message });
 		}
 	}
+
+	async function handleUndo(count = 1) {
+		if (!convention || undoHistory.length === 0) return;
+		try {
+			const result = await undoLastActions(convention.id, count);
+			toast.success('Cofnięto zmiany', { description: `${result.undone} akcji` });
+			closeEventPanel();
+			await loadSchedule();
+		} catch (error) {
+			toast.error('Nie udało się cofnąć', { description: error.message });
+		}
+	}
 </script>
+
+<svelte:window onkeydown={handleGridKeydown} />
 
 {#if loading}
 	<div class="flex h-full items-center justify-center text-sm text-muted-foreground">Ładowanie…</div>
@@ -2536,19 +3356,27 @@
 			<div class="sheet-toolbar-left">
 				<h1 class="sheet-title">{convention.name}</h1>
 				<span class="sheet-subtitle">
-					{daySections.length} {daySections.length === 1 ? 'dzień' : 'dni'} · {schedules.length} zaplanowanych · {unscheduled.length} oczekujących
+					{isPeopleMode ? 'Grafik osób' : 'Grafik atrakcji'} · {daySections.length} {daySections.length === 1 ? 'dzień' : 'dni'} · {schedules.length} {isPeopleMode ? 'wpisów' : 'atrakcji w planie'} · {isPeopleMode ? `${people.length} osób` : `${unscheduled.length} do zaplanowania`}
 				</span>
 			</div>
 			<div class="sheet-toolbar-right">
 				<button
 					class="sheet-btn"
+					onclick={() => handleUndo(1)}
+					disabled={autoScheduling || undoHistory.length === 0}
+					title={undoHistory[0]?.label || 'Brak akcji do cofnięcia'}
+				>
+					Cofnij
+				</button>
+				<button
+					class="sheet-btn"
 					onclick={handleClearSchedule}
 					disabled={autoScheduling || schedules.length === 0}
 				>
-					Odzaplanuj wszystko
+					Wyczyść grafik
 				</button>
 				<button class="sheet-btn sheet-btn--primary" onclick={handleAutoScheduleAll} disabled={autoScheduling || autoSchedulableCount === 0}>
-					{autoScheduling ? 'Planowanie…' : 'Auto-grafik'}
+					{autoScheduling ? 'Układam…' : 'Ułóż automatycznie'}
 				</button>
 			</div>
 		</header>
@@ -2587,17 +3415,33 @@
 							class:badge--off={!showInfoIssues}
 							onclick={() => (showInfoIssues = !showInfoIssues)}
 							aria-pressed={showInfoIssues}
-							title={showInfoIssues ? 'Ukryj info' : 'Pokaż info'}
+							title={showInfoIssues ? 'Ukryj informacje' : 'Pokaż informacje'}
 						>
-							{infoCount} info
+							{infoCount} informacji
 						</button>
 					{/if}
 					{#if showIssuesPanel}
 						{#each visibleIssues as issue}
-							<div class="sheet-issue sheet-issue--{issue.severity}">
+							<button
+								type="button"
+								class="sheet-issue sheet-issue--{issue.severity}"
+								class:sheet-issue--clickable={issue.scheduleIds?.length > 0}
+								class:sheet-issue--active={highlightedIssueKey === issue.key}
+								class:sheet-issue--active-error={highlightedIssueKey === issue.key &&
+									issue.severity === 'error'}
+								class:sheet-issue--active-warning={highlightedIssueKey === issue.key &&
+									issue.severity === 'warning'}
+								class:sheet-issue--active-info={highlightedIssueKey === issue.key &&
+									issue.severity === 'info'}
+								disabled={!issue.scheduleIds?.length}
+								title={issue.scheduleIds?.length
+									? 'Kliknij, aby podświetlić wpis w grafiku'
+									: undefined}
+								onclick={(event) => highlightIssueSchedules(event, issue)}
+							>
 								<span>{issue.severity === 'error' ? '✕' : issue.severity === 'warning' ? '⚠' : 'ℹ'}</span>
 								<span>{issue.message}</span>
-							</div>
+							</button>
 						{/each}
 					{/if}
 					<button
@@ -2615,24 +3459,47 @@
 		{#if chainSwap.mode === 'selecting' && chainSwapSource}
 			<div class="chain-swap-banner">
 				<div>
-					<strong>Planowanie zamiany:</strong>
-					<span> „{chainSwapSource.event.title}" jest zaznaczone. Kliknij atrakcję, której miejsce ma zająć.</span>
+					<strong>Zamiana miejsc:</strong>
+					<span> „{chainSwapSource.event.title}" jest zaznaczone. Kliknij wpis, na którego miejsce chcesz je przenieść.</span>
 				</div>
 				<button type="button" class="chain-swap-banner-btn" onclick={resetChainSwap}>Anuluj</button>
 			</div>
 		{:else if chainSwap.computing && chainSwapSource && chainSwapTarget}
 			<div class="chain-swap-banner">
 				<div>
-					<strong>Szukam sekwencji ruchów:</strong>
+					<strong>Szukam sposobu na zamianę…</strong>
 					<span> „{chainSwapSource.event.title}" → miejsce „{chainSwapTarget.event.title}"</span>
 				</div>
+			</div>
+		{/if}
+
+		{#if isPeopleMode && selectedSlot?.slot?.id}
+			<div class="highlight-banner">
+				<div>
+					<strong>Podświetlanie dostępności:</strong>
+					<span>
+						{formatTime(selectedSlot.slot.start_time)}
+						{#if selectedHighlightRoom}
+							· {selectedHighlightRoom.name}
+						{:else}
+							· najlepsze stanowisko (kliknij stanowisko, aby zawęzić)
+						{/if}
+					</span>
+				</div>
+				<button
+					type="button"
+					class="chain-swap-banner-btn"
+					onclick={() => (selectedSlot = null)}
+				>
+					Wyłącz
+				</button>
 			</div>
 		{/if}
 
 		<div class="sheet-body">
 			<div class="sheet-scroll" bind:this={sheetScrollEl}>
 				{#if daySections.length === 0}
-					<div class="sheet-empty">Brak slotów w grafiku</div>
+					<div class="sheet-empty">Brak terminów w grafiku</div>
 				{:else}
 					{#each daySections as day, dayIdx (day.date)}
 						<section class="sheet-day-section">
@@ -2650,7 +3517,38 @@
 								<div class="sheet-corner"></div>
 
 								{#each rooms as room, idx}
-									<div class="sheet-col-header" style="grid-column: {idx + 2}; grid-row: 1">
+									{@const roomClickable = isPeopleMode && !!selectedSlot?.slot?.id}
+									<button
+										type="button"
+										class="sheet-col-header"
+										class:sheet-col-header--clickable={roomClickable}
+										class:sheet-col-header--selected={selectedSlot?.roomId === room.id}
+										class:sheet-col-header--issue-focus={issueFocusActive &&
+											highlightedIssueRoomId === room.id}
+										class:sheet-col-header--issue-focus-error={issueFocusActive &&
+											highlightedIssueRoomId === room.id &&
+											highlightedIssueSeverity === 'error'}
+										class:sheet-col-header--issue-focus-warning={issueFocusActive &&
+											highlightedIssueRoomId === room.id &&
+											highlightedIssueSeverity === 'warning'}
+										class:sheet-col-header--issue-focus-info={issueFocusActive &&
+											highlightedIssueRoomId === room.id &&
+											highlightedIssueSeverity === 'info'}
+										style="grid-column: {idx + 2}; grid-row: 1"
+										disabled={!roomClickable}
+										title={roomClickable
+											? selectedSlot?.roomId === room.id
+												? 'Kliknij ponownie, aby pokazać najlepsze stanowisko'
+												: 'Kliknij, aby podświetlić dostępność dla tego stanowiska'
+											: undefined}
+										onclick={(event) => handleRoomHighlightClick(room, event)}
+										onkeydown={(e) => {
+											if (e.key === 'Enter' || e.key === ' ') {
+												e.preventDefault();
+												handleRoomHighlightClick(room, e);
+											}
+										}}
+									>
 										<span class="sheet-col-header-name">{formatRoomHeaderName(room)}</span>
 										<div class="sheet-col-header-tags">
 											{#each getRoomHeaderTags(room) as tag (tag)}
@@ -2659,29 +3557,58 @@
 												<span class="sheet-col-header-tag sheet-col-header-tag--empty">Brak tagów</span>
 											{/each}
 										</div>
-									</div>
+									</button>
 								{/each}
 
 								{#each day.timeSlots as slot, rowIdx}
-									<div
-										class="sheet-row-label sheet-row-label--tier{slotHypeTier(slot)}"
+									<button
+										type="button"
+										class="sheet-row-label {isPeopleMode ? '' : `sheet-row-label--tier${slotHypeTier(slot)}`}"
 										class:sheet-row-label--hour={isHourStart(slot.start_time)}
+										class:sheet-row-label--selected={selectedSlot?.slot?.id === slot.id}
+										class:sheet-row-label--issue-focus={issueFocusActive &&
+											highlightedIssueSlotIds.has(slot.id)}
+										class:sheet-row-label--issue-focus-error={issueFocusActive &&
+											highlightedIssueSlotIds.has(slot.id) &&
+											highlightedIssueSeverity === 'error'}
+										class:sheet-row-label--issue-focus-warning={issueFocusActive &&
+											highlightedIssueSlotIds.has(slot.id) &&
+											highlightedIssueSeverity === 'warning'}
+										class:sheet-row-label--issue-focus-info={issueFocusActive &&
+											highlightedIssueSlotIds.has(slot.id) &&
+											highlightedIssueSeverity === 'info'}
 										style="grid-column: 1; grid-row: {rowIdx + 2}"
-										title="Hype slotu: T{slotHypeTier(slot)}"
+										title={isPeopleMode
+											? selectedSlot?.slot?.id === slot.id
+												? 'Kliknij ponownie, aby wyłączyć podświetlanie'
+												: 'Kliknij, aby podświetlić dostępność w tej godzinie'
+											: `Popularność slotu: T${slotHypeTier(slot)}`}
+										disabled={!isPeopleMode}
+										onclick={(event) => handleSlotClick(slot, event)}
 									>
 										{formatTime(slot.start_time)}
-									</div>
+									</button>
 
 									{#each rooms as _room, colIdx}
-										{@const cellHint = dragState?.moved
-											? getCellHintData(dayIdx, colIdx, rowIdx)
-											: null}
+										{@const issueCellFocused =
+											issueFocusActive &&
+											highlightedIssueRoomId === rooms[colIdx].id &&
+											highlightedIssueSlotIds.has(slot.id)}
+										{@const cellHint = getCellHintData(dayIdx, colIdx, rowIdx)}
 										<div
 											class="sheet-cell"
 											class:sheet-cell--hour={isHourStart(slot.start_time)}
+											class:sheet-cell--issue-focus={issueCellFocused}
+											class:sheet-cell--issue-focus-error={issueCellFocused &&
+												highlightedIssueSeverity === 'error'}
+											class:sheet-cell--issue-focus-warning={issueCellFocused &&
+												highlightedIssueSeverity === 'warning'}
+											class:sheet-cell--issue-focus-info={issueCellFocused &&
+												highlightedIssueSeverity === 'info'}
 											class:sheet-cell--hint={cellHint}
 											class:sheet-cell--hint-error={cellHint?.kind === 'error'}
 											class:sheet-cell--hint-warning={cellHint?.kind === 'warning'}
+											class:sheet-cell--hint-info={cellHint?.kind === 'info'}
 											class:sheet-cell--hint-ok={cellHint?.kind === 'ok'}
 											class:sheet-cell--merge-top={cellHint?.mergeTop}
 											class:sheet-cell--merge-right={cellHint?.mergeRight}
@@ -2741,7 +3668,7 @@
 										{#each col.items as item (item.id)}
 											{@const appearance = getTileAppearance(item.id)}
 											{@const swapHint =
-												dragState?.moved && dragState.item.id !== item.id
+												activeHintItem && activeHintItem.id !== item.id
 													? placementHints.swaps.get(item.id)
 													: null}
 											{@const edgeAppearance = swapHint ?? appearance}
@@ -2752,6 +3679,16 @@
 												class:sheet-event--warning={appearance.kind === 'warning'}
 												class:sheet-event--info={appearance.kind === 'info'}
 												class:sheet-event--selected={selectedSchedule?.id === item.id}
+												class:sheet-event--issue-dimmed={issueFocusActive &&
+													!highlightedIssueScheduleIds.has(item.id)}
+												class:sheet-event--issue-focus={highlightedIssueScheduleIds.has(item.id)}
+												class:sheet-event--issue-focus-error={highlightedIssueScheduleIds.has(item.id) &&
+													highlightedIssueSeverity === 'error'}
+												class:sheet-event--issue-focus-warning={highlightedIssueScheduleIds.has(
+													item.id
+												) && highlightedIssueSeverity === 'warning'}
+												class:sheet-event--issue-focus-info={highlightedIssueScheduleIds.has(item.id) &&
+													highlightedIssueSeverity === 'info'}
 												class:sheet-event--locked={item.schedule.locked}
 												class:sheet-event--chain-source={chainSwap.sourceScheduleId === item.id}
 												class:sheet-event--chain-target={chainSwap.targetScheduleId === item.id}
@@ -2762,12 +3699,16 @@
 												class:sheet-event--chain-dimmed={chainPreviewActive &&
 													!chainPreviewMovingIds.has(item.id)}
 												class:sheet-event--dragging={dragState?.item?.id === item.id && dragState?.moved}
+												class:sheet-event--search-match={searchMatchScheduleIds?.has(item.id)}
+												class:sheet-event--search-dimmed={searchMatchScheduleIds &&
+													!searchMatchScheduleIds.has(item.id)}
 												class:sheet-event--drop-candidate={Boolean(swapHint)}
 												class:sheet-event--drag-edge={showDragEdge}
 												class:sheet-event--drag-edge-error={showDragEdge && edgeAppearance.kind === 'error'}
 												class:sheet-event--drag-edge-warning={showDragEdge && edgeAppearance.kind === 'warning'}
 												class:sheet-event--drag-edge-info={showDragEdge && edgeAppearance.kind === 'info'}
 												class:sheet-event--drag-edge-ok={showDragEdge && edgeAppearance.kind === 'ok'}
+												class:sheet-event--drop-candidate-pending={swapHint?.kind === 'pending'}
 												style="
 													top: {item.rowIdx * SLOT_HEIGHT + 1}px;
 													height: {getSlotTileHeight(item.schedule.slot_count)}px;
@@ -2786,10 +3727,18 @@
 														: `${item.schedule.event.title} — ${hostLabel(item.schedule)}`}"
 												onpointerdown={(event) => startEventDrag(event, item, dayIdx, colIdx)}
 												onclick={(event) => handleEventClick(event, item.schedule, event.currentTarget)}
+												ondblclick={(event) => handleEventDoubleClick(event, item.schedule, event.currentTarget)}
+												onkeydown={(event) => {
+													if (event.key === 'Enter') handleEventDoubleClick(event, item.schedule, event.currentTarget);
+													if (event.key === ' ') handleEventClick(event, item.schedule, event.currentTarget);
+												}}
 												oncontextmenu={(e) => {
 													e.preventDefault();
 													handleDeleteSchedule(item.id);
 												}}
+												role="button"
+												tabindex="0"
+												data-schedule-id={item.id}
 											>
 												<div class="sheet-event-meta">
 													<span class="sheet-event-time">
@@ -2800,7 +3749,9 @@
 															<Lock size={12} strokeWidth={2.4} />
 														</span>
 													{/if}
-													<span class="sheet-event-host">{hostLabel(item.schedule)}</span>
+													{#if !isPeopleMode}
+														<span class="sheet-event-host">{hostLabel(item.schedule)}</span>
+													{/if}
 													{#if appearance.kind === 'error'}
 														<span class="sheet-event-meta-icon sheet-event-meta-icon--error" aria-label="Błąd">
 															<CircleAlert size={12} strokeWidth={2.25} />
@@ -2822,7 +3773,7 @@
 														</span>
 													{/if}
 												</div>
-												<div class="sheet-event-title">{item.schedule.event.title}</div>
+												<div class="sheet-event-title"><span>{item.schedule.event.title}</span></div>
 											</div>
 										{/each}
 									</div>
@@ -2835,8 +3786,9 @@
 
 			<aside class="sheet-sidebar">
 				<div class="sheet-sidebar-header">
-					<span>Niezaplanowane</span>
+					<span>{isPeopleMode ? 'Osoby' : 'Do zaplanowania'}</span>
 					<div class="sheet-sidebar-header-actions">
+						{#if !isPeopleMode}
 						<button
 							type="button"
 							class="sheet-sidebar-sort"
@@ -2851,31 +3803,84 @@
 								<span>T↓</span>
 							{/if}
 						</button>
-						<span class="sheet-sidebar-count">{unscheduled.length}</span>
+						{/if}
+						<span class="sheet-sidebar-count">
+							{displayedUnscheduled.length}{sidebarSearchTerm ? ` / ${sidebarTotalCount}` : ''}
+						</span>
 					</div>
+				</div>
+				<div class="sheet-sidebar-search">
+					<Search size={14} strokeWidth={2.25} aria-hidden="true" />
+					<label class="sr-only" for="schedule-sidebar-search">
+						{isPeopleMode ? 'Szukaj osob' : 'Szukaj atrakcji'}
+					</label>
+					<input
+						id="schedule-sidebar-search"
+						class="sheet-sidebar-search-input"
+						type="search"
+						placeholder={isPeopleMode ? 'Szukaj osob...' : 'Szukaj atrakcji...'}
+						bind:value={sidebarSearch}
+						autocomplete="off"
+					/>
+					{#if sidebarSearch}
+						<button
+							type="button"
+							class="sheet-sidebar-search-clear"
+							aria-label="Wyczysc wyszukiwanie"
+							onclick={() => (sidebarSearch = '')}
+						>
+							<X size={13} strokeWidth={2.5} aria-hidden="true" />
+						</button>
+					{/if}
 				</div>
 				<div class="sheet-sidebar-list">
 					{#each displayedUnscheduled as event}
 						{@const dragItem = makeUnscheduledDragItem(event)}
+						{@const selectedFit = selectedSlotFits.get(event.id) ?? null}
 						<div
 							class="sheet-sidebar-item"
 							class:sheet-sidebar-item--dragging={dragState?.item?.id === dragItem.id && dragState?.moved}
+							class:sheet-sidebar-item--slot-ok={selectedFit?.tier === 1}
+							class:sheet-sidebar-item--slot-warn={selectedFit?.appearance?.kind === 'warning'}
+							class:sheet-sidebar-item--slot-info={selectedFit?.appearance?.kind === 'info'}
+							class:sheet-sidebar-item--slot-no={selectedFit?.tier === 3}
+							title={selectedFit
+								? `${selectedFit.room?.name ?? 'Stanowisko'}: ${selectedFit.appearance.messages?.[0] ?? 'OK'}`
+								: ''}
 							onpointerdown={(e) => startUnscheduledDrag(e, dragItem)}
 							onclick={(e) => handleUnscheduledClick(e, event, e.currentTarget)}
+							ondblclick={(e) => handleUnscheduledDoubleClick(e, event, e.currentTarget)}
+							onkeydown={(e) => {
+								if (e.key === 'Enter') handleUnscheduledDoubleClick(e, event, e.currentTarget);
+								if (e.key === ' ') handleUnscheduledClick(e, event, e.currentTarget);
+							}}
 							role="button"
 							tabindex="0"
 						>
 							<span class="sheet-sidebar-item-title">{event.title}</span>
 							<span class="sheet-sidebar-item-meta">
-								{hostLabel(event)} · {event.duration_minutes} min · T{event.tier ?? 2}
-								{#if event.auto_schedule === 0}
-									· ręcznie
+								{#if isPeopleMode}
+									{event.hours?.total_hours ?? 0} h · {event.hours?.schedule_count ?? 0} slotów
+									{#if event.hours?.min_blocks != null || event.hours?.max_blocks != null}
+										· cel {event.hours?.min_blocks ?? '—'}–{event.hours?.max_blocks ?? '—'}
+									{/if}
+								{:else}
+									{hostLabel(event)} · {event.duration_minutes} min · T{event.tier ?? 2}
+									{#if event.auto_schedule === 0}
+										· ręcznie
+									{/if}
 								{/if}
 							</span>
 						</div>
 					{/each}
-					{#if unscheduled.length === 0}
-						<div class="sheet-sidebar-empty">Wszystko zaplanowane</div>
+					{#if displayedUnscheduled.length === 0}
+						<div class="sheet-sidebar-empty">
+							{sidebarSearchTerm
+								? 'Brak wynikow'
+								: isPeopleMode
+									? 'Brak osob'
+									: 'Wszystko zaplanowane'}
+						</div>
 					{/if}
 				</div>
 			</aside>
@@ -3012,7 +4017,7 @@
 								class="chain-swap-secondary"
 								onclick={retryChainSwapSelection}
 							>
-								Wybierz inną atrakcję
+								Wybierz inny wpis
 							</button>
 						{/if}
 					</footer>
@@ -3056,6 +4061,7 @@
 			unscheduledEvent={selectedUnscheduledEvent}
 			anchorRect={panelAnchorRect}
 			{convention}
+			mode={isPeopleMode ? 'people' : 'events'}
 			{rooms}
 			timeSlots={panelTimeSlots}
 			issues={issues}
@@ -3315,10 +4321,52 @@
 		align-items: center;
 		gap: 0.375rem;
 		padding: 0.25rem 0.5rem;
+		border: 1px solid transparent;
 		border-radius: 4px;
+		appearance: none;
+		font: inherit;
 		font-size: 12px;
 		line-height: 1.3;
 		max-width: 100%;
+		text-align: left;
+	}
+
+	.sheet-issue--clickable {
+		cursor: pointer;
+	}
+
+	.sheet-issue--clickable:hover {
+		filter: brightness(0.97);
+	}
+
+	.sheet-issue:disabled {
+		cursor: default;
+	}
+
+	.sheet-issue--active {
+		outline: 2px solid #1a73e8;
+		outline-offset: 1px;
+	}
+
+	.sheet-issue--active-error {
+		outline: 3px solid #ea4335;
+		outline-offset: 1px;
+		box-shadow: 0 0 0 4px rgba(234, 67, 53, 0.22);
+		font-weight: 700;
+	}
+
+	.sheet-issue--active-warning {
+		outline: 3px solid #f9ab00;
+		outline-offset: 1px;
+		box-shadow: 0 0 0 4px rgba(249, 171, 0, 0.2);
+		font-weight: 700;
+	}
+
+	.sheet-issue--active-info {
+		outline: 3px solid #1a73e8;
+		outline-offset: 1px;
+		box-shadow: 0 0 0 4px rgba(26, 115, 232, 0.2);
+		font-weight: 700;
 	}
 
 	.sheet-issue--error {
@@ -3352,6 +4400,23 @@
 	}
 
 	.chain-swap-banner strong {
+		font-weight: 700;
+	}
+
+	.highlight-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 0.5rem 0.75rem;
+		background: #e8f0fe;
+		border-bottom: 1px solid #1a73e8;
+		color: #174ea6;
+		font-size: 12px;
+		flex-shrink: 0;
+	}
+
+	.highlight-banner strong {
 		font-weight: 700;
 	}
 
@@ -3648,11 +4713,58 @@
 		gap: 0.125rem;
 		padding: 0.25rem 0.5rem;
 		background: #f8f9fa;
+		appearance: none;
+		border: 0;
 		border-right: 1px solid #dadce0;
 		border-bottom: 1px solid #dadce0;
 		color: #3c4043;
+		font: inherit;
 		text-align: center;
 		overflow: hidden;
+	}
+
+	.sheet-col-header:disabled {
+		color: #3c4043;
+	}
+
+	.sheet-col-header--clickable {
+		cursor: pointer;
+	}
+
+	.sheet-col-header--clickable:hover {
+		background: #eef3fd;
+	}
+
+	.sheet-col-header--selected {
+		background: #e8f0fe;
+		color: #174ea6;
+		box-shadow: inset 0 -3px 0 #1a73e8;
+	}
+
+	.sheet-col-header--selected .sheet-col-header-name {
+		font-weight: 700;
+	}
+
+	.sheet-col-header--issue-focus {
+		font-weight: 700;
+	}
+
+	.sheet-col-header--issue-focus-error {
+		background: #fce8e6;
+		box-shadow: inset 0 -4px 0 #ea4335;
+		color: #c5221f;
+	}
+
+	.sheet-col-header--issue-focus-warning {
+		background: #fef7e0;
+		box-shadow: inset 0 -4px 0 #f9ab00;
+		color: #b06000;
+	}
+
+	.sheet-col-header--issue-focus-info {
+		background: #e8f0fe;
+		box-shadow: inset 0 -4px 0 #1a73e8;
+		color: #1967d2;
 	}
 
 	.sheet-col-header-name {
@@ -3701,6 +4813,12 @@
 		color: #9aa0a6;
 		font-variant-numeric: tabular-nums;
 		height: var(--slot-h);
+		appearance: none;
+		cursor: pointer;
+	}
+
+	.sheet-row-label:disabled {
+		cursor: default;
 	}
 
 	.sheet-row-label--hour {
@@ -3726,6 +4844,35 @@
 		box-shadow: inset 3px 0 0 color-mix(in srgb, #ea4335 50%, transparent);
 	}
 
+	.sheet-row-label--selected {
+		color: #174ea6;
+		font-weight: 700;
+		background: #e8f0fe;
+		box-shadow: inset 3px 0 0 #1a73e8;
+	}
+
+	.sheet-row-label--issue-focus {
+		font-weight: 700;
+	}
+
+	.sheet-row-label--issue-focus-error {
+		background: #fce8e6;
+		color: #c5221f;
+		box-shadow: inset 4px 0 0 #ea4335;
+	}
+
+	.sheet-row-label--issue-focus-warning {
+		background: #fef7e0;
+		color: #b06000;
+		box-shadow: inset 4px 0 0 #f9ab00;
+	}
+
+	.sheet-row-label--issue-focus-info {
+		background: #e8f0fe;
+		color: #1967d2;
+		box-shadow: inset 4px 0 0 #1a73e8;
+	}
+
 	.sheet-cell {
 		position: relative;
 		width: var(--room-w);
@@ -3738,6 +4885,27 @@
 
 	.sheet-cell--hour {
 		border-top: 1px solid #dadce0;
+	}
+
+	.sheet-cell--issue-focus {
+		background: color-mix(in srgb, var(--issue-focus-cell, #e8f0fe) 74%, #fff);
+		box-shadow: inset 0 0 0 2px var(--issue-focus-border, #1a73e8);
+		z-index: 2;
+	}
+
+	.sheet-cell--issue-focus-error {
+		--issue-focus-cell: #fce8e6;
+		--issue-focus-border: #ea4335;
+	}
+
+	.sheet-cell--issue-focus-warning {
+		--issue-focus-cell: #fef7e0;
+		--issue-focus-border: #f9ab00;
+	}
+
+	.sheet-cell--issue-focus-info {
+		--issue-focus-cell: #e8f0fe;
+		--issue-focus-border: #1a73e8;
 	}
 
 	.sheet-cell--hint {
@@ -3787,6 +4955,11 @@
 	.sheet-cell--hint-warning {
 		background: color-mix(in srgb, #fef7e0 68%, #fff);
 		--cell-hint-border: #f9ab00;
+	}
+
+	.sheet-cell--hint-info {
+		background: color-mix(in srgb, #e8f0fe 68%, #fff);
+		--cell-hint-border: #1a73e8;
 	}
 
 	.sheet-cell--hint-error {
@@ -3904,6 +5077,55 @@
 		z-index: 25;
 	}
 
+	.sheet-event--issue-dimmed {
+		opacity: 0.16;
+		filter: grayscale(0.7);
+	}
+
+	.sheet-event--issue-focus {
+		z-index: 36;
+		animation: issue-focus-pulse 1.15s ease-out;
+	}
+
+	.sheet-event--issue-focus-error {
+		outline: 4px solid #ea4335;
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 7px rgba(234, 67, 53, 0.24),
+			0 10px 30px rgba(234, 67, 53, 0.34);
+		transform: scale(1.03);
+	}
+
+	.sheet-event--issue-focus-warning {
+		outline: 4px solid #f9ab00;
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 7px rgba(249, 171, 0, 0.22),
+			0 10px 30px rgba(249, 171, 0, 0.28);
+		transform: scale(1.03);
+	}
+
+	.sheet-event--issue-focus-info {
+		outline: 4px solid #1a73e8;
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 7px rgba(26, 115, 232, 0.2),
+			0 10px 30px rgba(26, 115, 232, 0.26);
+		transform: scale(1.03);
+	}
+
+	@keyframes issue-focus-pulse {
+		0% {
+			transform: scale(1.08);
+		}
+		45% {
+			transform: scale(1.05);
+		}
+		100% {
+			transform: scale(1.03);
+		}
+	}
+
 	.sheet-event--chain-source {
 		outline: 3px solid #1a73e8;
 		outline-offset: 2px;
@@ -3935,6 +5157,19 @@
 	.sheet-event--chain-dimmed {
 		opacity: 0.28;
 		filter: grayscale(0.5);
+	}
+
+	/* Search: spotlight matching tiles, fade out the rest. */
+	.sheet-event--search-dimmed {
+		opacity: 0.22;
+		filter: grayscale(0.55);
+	}
+
+	.sheet-event--search-match {
+		outline: 2px solid #1a73e8;
+		outline-offset: 1px;
+		box-shadow: 0 2px 10px rgba(26, 115, 232, 0.35);
+		z-index: 24;
 	}
 
 	.sheet-event--chain-moving {
@@ -4093,6 +5328,13 @@
 			0 0 0 1px color-mix(in srgb, var(--ev-edge, var(--ev-border)) 34%, transparent);
 	}
 
+	.sheet-event--drop-candidate-pending:not(.sheet-event--drag-edge) {
+		background: #f1f3f4;
+		border-color: #9aa0a6;
+		color: #5f6368;
+		box-shadow: inset 0 0 0 1px rgba(95, 99, 104, 0.2);
+	}
+
 	.sheet-event--drag-edge {
 		border-width: 4px;
 		border-color: var(--ev-edge, var(--ev-border));
@@ -4214,14 +5456,20 @@
 	}
 
 	.sheet-event-title {
+		flex: 1 1 auto;
+		min-height: 0;
+		display: flex;
+		align-items: center;
+		overflow: hidden;
+	}
+
+	.sheet-event-title span {
 		font-size: 12px;
 		font-weight: 500;
 		color: #202124;
 		line-height: 1.35;
 		word-break: break-word;
 		overflow-wrap: break-word;
-		flex: 1 1 auto;
-		min-height: 0;
 		overflow: hidden;
 		display: -webkit-box;
 		-webkit-box-orient: vertical;
@@ -4289,6 +5537,55 @@
 		font-size: 11px;
 	}
 
+	.sheet-sidebar-search {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.5rem 0.625rem;
+		border-bottom: 1px solid #dadce0;
+		background: #fff;
+		color: #5f6368;
+		flex-shrink: 0;
+	}
+
+	.sheet-sidebar-search-input {
+		min-width: 0;
+		flex: 1;
+		height: 1.875rem;
+		border: 1px solid #dadce0;
+		border-radius: 4px;
+		background: #fff;
+		padding: 0 0.5rem;
+		font: inherit;
+		font-size: 12px;
+		color: #202124;
+		outline: none;
+	}
+
+	.sheet-sidebar-search-input:focus {
+		border-color: #1a73e8;
+		box-shadow: 0 0 0 1px #1a73e8;
+	}
+
+	.sheet-sidebar-search-clear {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 1.75rem;
+		height: 1.75rem;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		background: transparent;
+		color: #5f6368;
+		cursor: pointer;
+		flex-shrink: 0;
+	}
+
+	.sheet-sidebar-search-clear:hover {
+		background: #f1f3f4;
+		color: #202124;
+	}
+
 	.sheet-sidebar-list {
 		flex: 1;
 		overflow-y: auto;
@@ -4325,6 +5622,26 @@
 	.sheet-sidebar-item:hover {
 		background: #f8f9fa;
 		border-color: #bdc1c6;
+	}
+
+	.sheet-sidebar-item--slot-ok {
+		background: #e6f4ea;
+		border-color: #34a853;
+	}
+
+	.sheet-sidebar-item--slot-warn {
+		background: #fef7e0;
+		border-color: #fbbc04;
+	}
+
+	.sheet-sidebar-item--slot-info {
+		background: #e8f0fe;
+		border-color: #1a73e8;
+	}
+
+	.sheet-sidebar-item--slot-no {
+		background: #fce8e6;
+		border-color: #ea4335;
 	}
 
 	.sheet-sidebar-item-title {
