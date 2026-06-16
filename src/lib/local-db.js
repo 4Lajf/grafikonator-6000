@@ -4380,6 +4380,47 @@ function rowsToCsv(rows) {
 	return rows.map((row) => row.map(csvEscape).join(',')).join('\n');
 }
 
+function formatPublicTime(value) {
+	const text = String(value ?? '');
+	return text.length >= 5 ? text.slice(0, 5) : text;
+}
+
+function formatPublicTimeRange(start, end) {
+	const startText = formatPublicTime(start);
+	const endText = formatPublicTime(end);
+	return startText && endText ? `${startText}-${endText}` : startText || endText;
+}
+
+function addPublicScheduleCell(cellsBySlotRoom, slotId, roomId, value) {
+	if (!slotId || !roomId || !value) return;
+	const key = `${slotId}|${roomId}`;
+	const values = cellsBySlotRoom.get(key) ?? [];
+	if (!values.includes(value)) values.push(value);
+	cellsBySlotRoom.set(key, values);
+}
+
+function publicScheduleLabel(...parts) {
+	const values = [];
+	for (const part of parts) {
+		const value = String(part ?? '').trim();
+		if (value && !values.includes(value)) values.push(value);
+	}
+	return values.join('\n');
+}
+
+function publicScheduleRows(conventionId, cellsBySlotRoom) {
+	const rooms = getRooms(conventionId);
+	const rows = [['Data', 'Godzina', ...rooms.map((room) => room.name)]];
+	for (const slot of getTimeSlots(conventionId)) {
+		rows.push([
+			slot.date,
+			formatPublicTimeRange(slot.start_time, slot.end_time),
+			...rooms.map((room) => (cellsBySlotRoom.get(`${slot.id}|${room.id}`) ?? []).join('\n\n'))
+		]);
+	}
+	return rows;
+}
+
 export function exportDataJson() {
 	ensureLoaded();
 	return JSON.stringify(
@@ -4575,7 +4616,7 @@ export function importDataJson(jsonText, options = {}) {
 	return getConventions();
 }
 
-export function exportScheduleCsv(conventionId) {
+function exportScheduleCsvLegacy(conventionId) {
 	ensureLoaded();
 	const convention = getConvention(conventionId);
 	if (!convention) throw new Error('Nie znaleziono konwentu');
@@ -4648,6 +4689,38 @@ export function exportScheduleCsv(conventionId) {
 		]);
 	}
 	return rowsToCsv(rows);
+}
+
+export function exportScheduleCsv(conventionId) {
+	ensureLoaded();
+	const convention = getConvention(conventionId);
+	if (!convention) throw new Error('Nie znaleziono konwentu');
+
+	const mode = normalizeScheduleMode(convention.schedule_mode);
+	const cellsBySlotRoom = new Map();
+
+	if (mode === SCHEDULE_MODES.PEOPLE) {
+		for (const schedule of getPeopleSchedules(conventionId)) {
+			addPublicScheduleCell(
+				cellsBySlotRoom,
+				schedule.time_slot_id,
+				schedule.room_id,
+				schedule.person?.display_name
+			);
+		}
+		return rowsToCsv(publicScheduleRows(conventionId, cellsBySlotRoom));
+	}
+
+	for (const schedule of getSchedules(conventionId)) {
+		const label = publicScheduleLabel(schedule.event?.title, schedule.host_name);
+		const block = getSlotBlock(conventionId, schedule.start_time_slot_id, schedule.slot_count || 1);
+		const slots = block.length ? block : schedule.start_slot ? [schedule.start_slot] : [];
+		for (const slot of slots) {
+			addPublicScheduleCell(cellsBySlotRoom, slot.id, schedule.room_id, label);
+		}
+	}
+
+	return rowsToCsv(publicScheduleRows(conventionId, cellsBySlotRoom));
 }
 
 export function clearAllData() {

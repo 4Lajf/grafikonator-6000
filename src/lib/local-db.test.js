@@ -516,7 +516,13 @@ describe('autoScheduleEvent', () => {
 		createSchedule({ event_id: event.id, room_id: room.id, start_time_slot_id: slot.id, slot_count: 1 });
 
 		const csv = exportScheduleCsv(convention.id);
+		expect(csv.split('\n')[0]).toBe('Data,Godzina,Main');
+		expect(csv).toContain('2026-06-01,10:00-11:00');
 		expect(csv).toContain('Panel');
+		expect(csv).toContain('Host');
+		expect(csv).not.toContain('Tier');
+		expect(csv).not.toContain('Kolor');
+		expect(csv).not.toContain('Tagi');
 		const json = exportDataJson();
 		clearAllData();
 		importDataJson(json, { convertEventsToPeople: true });
